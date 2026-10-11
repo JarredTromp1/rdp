@@ -1,4 +1,4 @@
-```yaml
+
 name: RDP
 
 on:
@@ -217,4 +217,4 @@ jobs:
           }
 
           Write-Host "Configured runtime elapsed. Ending RDP workflow."
-```
+
