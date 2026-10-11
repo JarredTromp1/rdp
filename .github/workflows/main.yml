@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "How many hours should RDP stay active? (1-5)"
+        description: "RDP runtime in hours"
         required: true
         default: "2"
         type: choice
@@ -16,6 +16,9 @@ on:
           - "4"
           - "5"
 
+permissions:
+  contents: read
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -25,26 +28,33 @@ jobs:
       RDP_HOURS: ${{ inputs.hours }}
 
     steps:
-      - name: Validate Runtime
+      - name: Set Runtime Deadline
         shell: pwsh
         run: |
           $hours = 0
-          if (-not [int]::TryParse(
-              $env:RDP_HOURS, [ref]$hours
-          ) -or $hours -lt 1 -or $hours -gt 5) {
+
+          if (-not [int]::TryParse($env:RDP_HOURS, [ref]$hours) -or
+              $hours -lt 1 -or $hours -gt 5) {
               throw "Runtime must be between 1 and 5 hours."
           }
 
-          Write-Host "RDP runtime configured for $hours hour(s)."
+          $deadline = [DateTimeOffset]::UtcNow.AddHours($hours)
 
-      - name: Configure RDP Securely
+          "RDP_STOP_UTC=$($deadline.ToString('o'))" |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Runtime: $hours hour(s)"
+          Write-Host "Deadline UTC: $($deadline.ToString('o'))"
+
+      - name: Configure Windows RDP
         shell: pwsh
         run: |
+          $tsRange = '100.64.0.0/10'
+
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name fDenyTSConnections -Value 0
 
-          # Keep Network Level Authentication enabled.
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name UserAuthentication -Value 1
@@ -53,7 +63,6 @@ jobs:
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name SecurityLayer -Value 2
 
-          # Allow RDP only from Tailscale IPv4 addresses.
           Get-NetFirewallRule -DisplayName 'RDP-Tailscale' `
             -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule
@@ -64,76 +73,85 @@ jobs:
             -Action Allow `
             -Protocol TCP `
             -LocalPort 3389 `
-            -RemoteAddress '100.64.0.0/10' `
+            -RemoteAddress $tsRange `
             -Profile Any
 
           Set-Service -Name TermService -StartupType Manual
           Start-Service -Name TermService
 
-      - name: Create RDP User
+          Write-Host "RDP configured with NLA enabled."
+
+      - name: Configure RDP Account
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-              throw "Set the RDP_PASSWORD repository secret first."
+              throw "RDP_PASSWORD secret is missing."
           }
 
-          $securePass = ConvertTo-SecureString `
+          $securePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD -AsPlainText -Force
 
           $user = Get-LocalUser -Name 'RDP' `
             -ErrorAction SilentlyContinue
 
           if ($user) {
-              Set-LocalUser -Name 'RDP' -Password $securePass
+              Set-LocalUser -Name 'RDP' -Password $securePassword
           } else {
               New-LocalUser `
                 -Name 'RDP' `
-                -Password $securePass `
-                -AccountNeverExpires
+                -Password $securePassword `
+                -AccountNeverExpires | Out-Null
           }
 
-          $rdpGroup = Get-LocalGroup -SID 'S-1-5-32-555'
-          $members = Get-LocalGroupMember -Group $rdpGroup.Name
+          $group = Get-LocalGroup -SID 'S-1-5-32-555'
+          $members = Get-LocalGroupMember -Group $group.Name `
+            -ErrorAction SilentlyContinue
 
           if (-not ($members | Where-Object {
-              $_.Name -eq "$env:COMPUTERNAME\RDP"
+              $_.Name -match '\\RDP$' -or $_.Name -eq 'RDP'
           })) {
-              Add-LocalGroupMember -Group $rdpGroup.Name -Member 'RDP'
+              Add-LocalGroupMember -Group $group.Name -Member 'RDP'
           }
 
-          Write-Host "RDP user configured. Password is not printed."
+          Write-Host "RDP account is ready."
 
       - name: Install Tailscale
         shell: pwsh
         run: |
-          $tsUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi'
-          $installerPath = Join-Path $env:TEMP 'tailscale.msi'
+          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+          $installer = Join-Path $env:TEMP 'tailscale.msi'
 
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
           try {
               $process = Start-Process msiexec.exe `
-                -ArgumentList @('/i', "`"$installerPath`"", '/quiet', '/norestart') `
+                -ArgumentList @('/i', "`"$installer`"", '/quiet', '/norestart') `
                 -Wait -PassThru
 
               if ($process.ExitCode -notin @(0, 3010)) {
                   throw "Tailscale installation failed: $($process.ExitCode)"
               }
-          } finally {
-              Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          }
+          finally {
+              Remove-Item $installer -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Establish Tailscale Connection
+      - name: Connect Tailscale
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-              throw "TAILSCALE_AUTH_KEY secret is missing."
+              throw "TAILSCALE_AUTH_KEY secret is missing or unavailable."
           }
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+              throw "Tailscale executable not found: $ts"
+          }
 
           & $ts up `
             "--authkey=$env:TAILSCALE_AUTH_KEY" `
@@ -146,11 +164,13 @@ jobs:
           $tsIP = $null
 
           for ($i = 0; $i -lt 12; $i++) {
-              $candidate = & $ts ip -4
-              if ($LASTEXITCODE -eq 0 -and $candidate) {
-                  $tsIP = ($candidate | Select-Object -First 1).Trim()
+              $output = & $ts ip -4
+
+              if ($LASTEXITCODE -eq 0 -and $output) {
+                  $tsIP = "$($output | Select-Object -First 1)".Trim()
                   if ($tsIP) { break }
               }
+
               Start-Sleep -Seconds 5
           }
 
@@ -158,63 +178,62 @@ jobs:
               throw "Tailscale did not assign an IPv4 address."
           }
 
-          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IPv4 address: $tsIP"
+          "TAILSCALE_IP=$tsIP" |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Verify RDP Accessibility
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Verify Local RDP Listener
         shell: pwsh
         run: |
           $deadline = (Get-Date).AddMinutes(2)
-          $connected = $false
+          $listening = $false
 
           do {
-              $result = Test-NetConnection `
-                -ComputerName $env:TAILSCALE_IP `
-                -Port 3389 `
-                -WarningAction SilentlyContinue
+              $listener = Get-NetTCPConnection `
+                -State Listen -LocalPort 3389 `
+                -ErrorAction SilentlyContinue
 
-              if ($result.TcpTestSucceeded) {
-                  $connected = $true
+              if ($listener) {
+                  $listening = $true
                   break
               }
 
               Start-Sleep -Seconds 5
           } while ((Get-Date) -lt $deadline)
 
-          if (-not $connected) {
-              throw "RDP port 3389 did not become reachable."
+          if (-not $listening) {
+              throw "RDP is not listening on TCP port 3389."
           }
 
-          Write-Host "RDP TCP connectivity verified."
+          Write-Host "Local RDP listener is active."
 
-      - name: Maintain Connection Until Deadline
+      - name: Maintain RDP Until Deadline
         shell: pwsh
         run: |
-          $hours = [int]$env:RDP_HOURS
-          $duration = [TimeSpan]::FromHours($hours)
-          $stopAt = (Get-Date).Add($duration)
+          $stopAt = [DateTimeOffset]::Parse(
+              $env:RDP_STOP_UTC
+          )
 
           Write-Host ""
-          Write-Host "===== RDP ACCESS ====="
+          Write-Host "========== RDP ACCESS =========="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: Use the configured RDP_PASSWORD secret"
-          Write-Host "Automatic stop: $($stopAt.ToString('yyyy-MM-dd HH:mm:ss'))"
-          Write-Host "Runtime: $hours hour(s)"
-          Write-Host "======================"
+          Write-Host "Password: The value configured in RDP_PASSWORD"
+          Write-Host "Automatic stop UTC: $($stopAt.ToString('u'))"
+          Write-Host "================================"
 
-          while ((Get-Date) -lt $stopAt) {
-              $remaining = $stopAt - (Get-Date)
+          while ([DateTimeOffset]::UtcNow -lt $stopAt) {
+              $remaining = $stopAt - [DateTimeOffset]::UtcNow
 
-              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP active. Remaining: $($remaining.ToString('hh\:mm\:ss'))"
+              Write-Host "RDP active. Remaining: $($remaining.ToString('hh\:mm\:ss'))"
 
-              $sleepSeconds = [Math]::Min(
+              $seconds = [Math]::Min(
                   60,
-                  [Math]::Max(1, [int][Math]::Ceiling($remaining.TotalSeconds))
+                  [Math]::Max(1, [Math]::Ceiling($remaining.TotalSeconds))
               )
 
-              Start-Sleep -Seconds $sleepSeconds
+              Start-Sleep -Seconds $seconds
           }
 
-          Write-Host "Configured runtime elapsed. Ending RDP workflow."
-
+          Write-Host "Configured runtime reached. Finishing workflow."
