@@ -28,6 +28,20 @@ jobs:
       RDP_HOURS: ${{ inputs.hours }}
 
     steps:
+    
+      - name: Check Tailscale Secret
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $key = $env:TAILSCALE_AUTH_KEY
+
+          if ($null -eq $key -or $key.Trim().Length -eq 0) {
+              throw "Secret is unavailable or empty. Re-create TAILSCALE_AUTH_KEY in repository secrets."
+          }
+
+          Write-Host "Secret is available. Character count: $($key.Length)"
+
       - name: Set Runtime Deadline
         shell: pwsh
         run: |
