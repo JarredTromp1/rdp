@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "RDP runtime in hours"
+        description: "How many hours should the session run?"
         required: true
         default: "2"
         type: choice
@@ -32,25 +32,21 @@ jobs:
         shell: pwsh
         run: |
           $hours = 0
-
           if (-not [int]::TryParse($env:RDP_HOURS, [ref]$hours) -or
               $hours -lt 1 -or $hours -gt 5) {
               throw "Runtime must be between 1 and 5 hours."
           }
 
           $deadline = [DateTimeOffset]::UtcNow.AddHours($hours)
-
           "RDP_STOP_UTC=$($deadline.ToString('o'))" |
-              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-          Write-Host "Runtime: $hours hour(s)"
-          Write-Host "Deadline UTC: $($deadline.ToString('o'))"
+          Write-Host "Runtime configured: $hours hour(s)"
+          Write-Host "Stop deadline UTC: $($deadline.ToString('o'))"
 
       - name: Configure Windows RDP
         shell: pwsh
         run: |
-          $tsRange = '100.64.0.0/10'
-
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name fDenyTSConnections -Value 0
@@ -73,13 +69,13 @@ jobs:
             -Action Allow `
             -Protocol TCP `
             -LocalPort 3389 `
-            -RemoteAddress $tsRange `
+            -RemoteAddress '100.64.0.0/10' `
             -Profile Any
 
           Set-Service -Name TermService -StartupType Manual
           Start-Service -Name TermService
 
-          Write-Host "RDP configured with NLA enabled."
+          Write-Host "Windows RDP configured."
 
       - name: Configure RDP Account
         shell: pwsh
@@ -87,7 +83,7 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-              throw "RDP_PASSWORD secret is missing."
+              throw "RDP_PASSWORD secret is missing or unavailable."
           }
 
           $securePassword = ConvertTo-SecureString `
@@ -115,7 +111,7 @@ jobs:
               Add-LocalGroupMember -Group $group.Name -Member 'RDP'
           }
 
-          Write-Host "RDP account is ready."
+          Write-Host "RDP account configured."
 
       - name: Install Tailscale
         shell: pwsh
@@ -138,27 +134,35 @@ jobs:
               Remove-Item $installer -Force -ErrorAction SilentlyContinue
           }
 
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+              throw "Tailscale executable not found."
+          }
+
+      - name: Diagnose Tailscale Secret
+        shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) {
+              throw "TAILSCALE_AUTH_KEY is empty or unavailable. Check repository secrets."
+          }
+
+          Write-Host "Tailscale secret is present and nonempty."
+
       - name: Connect Tailscale
         shell: pwsh
         env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-              throw "TAILSCALE_AUTH_KEY secret is missing or unavailable."
-          }
-
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          if (-not (Test-Path $ts)) {
-              throw "Tailscale executable not found: $ts"
-          }
-
           & $ts up `
-            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--authkey=$env:TS_KEY" `
             "--hostname=gh-runner-$env:GITHUB_RUN_ID"
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Tailscale connection failed."
+              throw "Tailscale failed to connect. Check the auth key and tailnet policy."
           }
 
           $tsIP = $null
@@ -179,7 +183,7 @@ jobs:
           }
 
           "TAILSCALE_IP=$tsIP" |
-              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
           Write-Host "Tailscale IP: $tsIP"
 
@@ -211,15 +215,13 @@ jobs:
       - name: Maintain RDP Until Deadline
         shell: pwsh
         run: |
-          $stopAt = [DateTimeOffset]::Parse(
-              $env:RDP_STOP_UTC
-          )
+          $stopAt = [DateTimeOffset]::Parse($env:RDP_STOP_UTC)
 
           Write-Host ""
           Write-Host "========== RDP ACCESS =========="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: The value configured in RDP_PASSWORD"
+          Write-Host "Password: Use your RDP_PASSWORD secret"
           Write-Host "Automatic stop UTC: $($stopAt.ToString('u'))"
           Write-Host "================================"
 
@@ -236,4 +238,4 @@ jobs:
               Start-Sleep -Seconds $seconds
           }
 
-          Write-Host "Configured runtime reached. Finishing workflow."
+          Write-Host "Runtime reached. Ending workflow."
