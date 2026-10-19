@@ -30,56 +30,71 @@ jobs:
       - name: Set Runtime Deadline
         shell: pwsh
         run: |
-          $hours = 0
+          $hours = [int]$env:RDP_HOURS
+          if ($hours -lt 1 -or$hours -gt 5) { throw "Invalid hours" }
+          $deadline = [DateTimeOffset]::UtcNow.AddHours($hours).ToString('o')
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_STOP_UTC=$deadline"
+          Write-Host "Runtime: $hours hour(s) \vert{} Deadline UTC:$deadline"
 
-          if (-not [int]::TryParse($env:RDP_HOURS, [ref]$hours) -or
-              $hours -lt 1 -or$hours -gt 5) {
-              throw "Runtime must be between 1 and 5 hours."
-          }
-
-          $deadline = [DateTimeOffset]::UtcNow.AddHours($hours)
-
-          "RDP_STOP_UTC=$($deadline.ToString('o'))" |
-            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          Write-Host "Runtime: $hours hour(s)"
-          Write-Host "Deadline UTC: $($deadline.ToString('u'))"
-
-      - name: Configure Core RDP & Admin UAC Settings
+      - name: Configure RDP and Disable UAC
         shell: pwsh
         run: |
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0 -Force
+          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
+          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 1 /f
+          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /t REG_DWORD /d 2 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableLUA /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10 profile=any
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=UDP localport=3389 remoteip=100.64.0.0/10 profile=any
+          sc.exe config TermService start= demand
+          net start TermService ; $true
 
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 1 -Force
+      - name: Create Admin RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "RDP_PASSWORD secret is missing." }
+          net user RDP "$env:RDP_PASSWORD" /add /Y /expires:never
+          net user RDP "$env:RDP_PASSWORD" /Y
+          wmic useraccount where "Name='RDP'" set PasswordExpires=False
+          net localgroup "Administrators" RDP /add ; $true
+          net localgroup "Remote Desktop Users" RDP /add ; $true
+          Write-Host "RDP user created and added to Administrators."
 
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name SecurityLayer -Value 2 -Force
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi$proc = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" TS_UNATTENDEDMODE=always /quiet /norestart" -Wait -PassThru
+          if ($proc.ExitCode -notin @(0, 3010)) { throw "MSI failed: $($proc.ExitCode)" }
+          Remove-Item $msi -Force -ErrorAction SilentlyContinue
+          net start Tailscale ; $true
+          Start-Sleep -Seconds 3
 
-          # Disable UAC prompts so the RDP admin user can install software without blocks
-          Set-ItemProperty `
-            -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
-            -Name ConsentPromptBehaviorAdmin -Value 0 -Force
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) { throw "TAILSCALE_AUTH_KEY secret is missing." }
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up "--authkey=$env:TS_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID" "--unattended" "--reset"
+          if ($LASTEXITCODE -ne 0) { throw "Tailscale up failed." }
+          $tsIP =$null
+          for ($i = 0; $i -lt 15; $i++) {
+            $out = &$ts ip -4
+            if ($LASTEXITCODE -eq 0 -and $out) {$tsIP = "$($out | Select-Object -First 1)".Trim()
+              if ($tsIP) { break }
+            }
+            Start-Sleep -Seconds 3
+          }
+          if (-not $tsIP) { throw "No Tailscale IP assigned." }
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+          Write-Host "Connected! Tailscale IP: $tsIP"
 
-          Set-ItemProperty `
-            -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
-            -Name EnableLUA -Value 0 -Force
-
-          Get-NetFirewallRule -DisplayName 'RDP-Tailscale*' `
-            -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
-
-          New-NetFirewallRule `
-            -DisplayName 'RDP-Tailscale-TCP' `
-            -Direction Inbound `
-            -Action Allow `
-            -Protocol TCP `
-            -LocalPort 3389 `
-            -RemoteAddress '100.64.0.0/10' `
-            -Profile Any | Out-Null
-
-          New-NetFirewall
+      - name: Maintain Connection Until Deadline
+        shell: pw
