@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "How many hours should the session run?"
+        description: "Session hours (1-5)"
         required: true
         default: "2"
         type: choice
@@ -22,68 +22,48 @@ jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 360
-
     env:
       RDP_HOURS: ${{ inputs.hours }}
-
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
     steps:
-      - name: Set Runtime Deadline
+      - name: Start Admin RDP and Tailscale
         shell: pwsh
         run: |
           $hours = [int]$env:RDP_HOURS
-          if ($hours -lt 1 -or$hours -gt 5) { throw "Invalid hours" }
-          $deadline = [DateTimeOffset]::UtcNow.AddHours($hours).ToString('o')
-          Add-Content -Path $env:GITHUB_ENV -Value "RDP_STOP_UTC=$deadline"
-          Write-Host "Runtime: $hours hour(s) \vert{} Deadline UTC:$deadline"
+          $stopAt = [DateTimeOffset]::UtcNow.AddHours($hours)
 
-      - name: Configure RDP and Disable UAC
-        shell: pwsh
-        run: |
           reg add "HKLM\System\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
           reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 1 /f
           reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /t REG_DWORD /d 2 /f
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableLUA /t REG_DWORD /d 0 /f
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f
+
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10 profile=any
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=UDP localport=3389 remoteip=100.64.0.0/10 profile=any
           sc.exe config TermService start= demand
           net start TermService ; $true
 
-      - name: Create Admin RDP User
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "RDP_PASSWORD secret is missing." }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "Missing RDP_PASSWORD" }
           net user RDP "$env:RDP_PASSWORD" /add /Y /expires:never
           net user RDP "$env:RDP_PASSWORD" /Y
           wmic useraccount where "Name='RDP'" set PasswordExpires=False
           net localgroup "Administrators" RDP /add ; $true
           net localgroup "Remote Desktop Users" RDP /add ; $true
-          Write-Host "RDP user created and added to Administrators."
 
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $msi = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri $url -OutFile $msi$proc = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" TS_UNATTENDEDMODE=always /quiet /norestart" -Wait -PassThru
-          if ($proc.ExitCode -notin @(0, 3010)) { throw "MSI failed: $($proc.ExitCode)" }
-          Remove-Item $msi -Force -ErrorAction SilentlyContinue
+          if ($proc.ExitCode -notin @(0, 3010)) { throw "MSI failed" }
           net start Tailscale ; $true
           Start-Sleep -Seconds 3
 
-      - name: Establish Tailscale Connection
-        shell: pwsh
-        env:
-          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) { throw "TAILSCALE_AUTH_KEY secret is missing." }
+          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) { throw "Missing TAILSCALE_AUTH_KEY" }
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           & $ts up "--authkey=$env:TS_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID" "--unattended" "--reset"
-          if ($LASTEXITCODE -ne 0) { throw "Tailscale up failed." }
+
           $tsIP =$null
           for ($i = 0; $i -lt 15; $i++) {
             $out = &$ts ip -4
@@ -92,9 +72,16 @@ jobs:
             }
             Start-Sleep -Seconds 3
           }
-          if (-not $tsIP) { throw "No Tailscale IP assigned." }
-          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
-          Write-Host "Connected! Tailscale IP: $tsIP"
+          if (-not $tsIP) { throw "No Tailscale IP assigned" }
 
-      - name: Maintain Connection Until Deadline
-        shell: pw
+          Write-Host "========== RDP ACCESS =========="
+          Write-Host "IP Address = $tsIP"
+          Write-Host "Username   = RDP (Administrator)"
+          Write-Host "Password   = Your RDP_PASSWORD secret"
+          Write-Host "================================"
+
+          while ([DateTimeOffset]::UtcNow -lt $stopAt) {
+            $rem =$stopAt - [DateTimeOffset]::UtcNow
+            Write-Host "RDP Active - Remaining $($rem.Hours)h $($rem.Minutes)m"
+            Start-Sleep -Seconds 60
+          }
