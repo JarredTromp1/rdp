@@ -45,13 +45,15 @@ jobs:
           Write-Host "Runtime: $hours hour(s)"
           Write-Host "Deadline UTC: $($deadline.ToString('u'))"
 
-      - name: Configure Core RDP Settings
+      - name: Configure Core RDP & Admin UAC Settings
         shell: pwsh
         run: |
+          # Allow RDP connections
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name fDenyTSConnections -Value 0 -Force
 
+          # Keep Network Level Authentication enabled
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name UserAuthentication -Value 1 -Force
@@ -60,31 +62,48 @@ jobs:
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name SecurityLayer -Value 2 -Force
 
-          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' `
+          # Disable UAC prompts so the RDP admin user can install software seamlessly
+          Set-ItemProperty `
+            -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
+            -Name ConsentPromptBehaviorAdmin -Value 0 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
+            -Name EnableLUA -Value 0 -Force
+
+          # Configure Firewall for both TCP and UDP over Tailscale CGNAT subnet
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale*' `
             -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule
 
           New-NetFirewallRule `
-            -DisplayName 'RDP-Tailscale' `
+            -DisplayName 'RDP-Tailscale-TCP' `
             -Direction Inbound `
             -Action Allow `
             -Protocol TCP `
             -LocalPort 3389 `
             -RemoteAddress '100.64.0.0/10' `
-            -Profile Any
+            -Profile Any | Out-Null
+
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale-UDP' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol UDP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any | Out-Null
 
           Set-Service -Name TermService -StartupType Manual
           Start-Service -Name TermService
 
-          Write-Host "RDP settings configured."
+          Write-Host "RDP and UAC settings configured."
 
-      - name: Create RDP User and Assign Groups
+      - name: Create Admin RDP User
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $ErrorActionPreference = 'Stop'
-
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
               throw "RDP_PASSWORD secret is missing."
           }
@@ -96,81 +115,41 @@ jobs:
             -ErrorAction SilentlyContinue
 
           if ($user) {
-              Set-LocalUser -Name 'RDP' -Password $securePassword
+              Set-LocalUser -Name 'RDP' -Password $securePassword -PasswordNeverExpires$true
           } else {
               New-LocalUser `
                 -Name 'RDP' `
                 -Password $securePassword `
-                -AccountNeverExpires | Out-Null
+                -AccountNeverExpires `
+                -PasswordNeverExpires | Out-Null
           }
 
-          $user = Get-LocalUser -Name 'RDP'
-          $userSid = $user.SID.Value
+          # Add RDP user to both Remote Desktop Users (S-1-5-32-555) and Administrators (S-1-5-32-544)
+          $targetSIDs = @('S-1-5-32-555', 'S-1-5-32-544')
 
-          # Add RDP to the local Administrators group.
-          $adminGroup = Get-LocalGroup -SID 'S-1-5-32-544'
-          $adminMembers = Get-LocalGroupMember `
-            -Group $adminGroup.Name -ErrorAction Stop
+          foreach ($sid in$targetSIDs) {
+              $group = Get-LocalGroup -SID$sid
+              $members = Get-LocalGroupMember -Group$group.Name -ErrorAction SilentlyContinue
 
-          $isAdmin = $false
-
-          foreach ($member in $adminMembers) {
-              if ($member.SID -and $member.SID.Value -eq $userSid) {
-                  $isAdmin = $true
-                  break
+              if (-not ($members \vert{} Where-Object {$_.Name -match '\\RDP$' -or$_.Name -eq 'RDP' })) {
+                  Add-LocalGroupMember -Group $group.Name -Member 'RDP'
+                  Write-Host "Added RDP to $($group.Name)"
               }
           }
 
-          if (-not $isAdmin) {
-              Add-LocalGroupMember `
-                -Group $adminGroup.Name -Member $user.Name
-          }
-
-          # Add RDP to the Remote Desktop Users group.
-          $rdpGroup = Get-LocalGroup -SID 'S-1-5-32-555'
-          $rdpMembers = Get-LocalGroupMember `
-            -Group $rdpGroup.Name -ErrorAction Stop
-
-          $canRdp = $false
-
-          foreach ($member in $rdpMembers) {
-              if ($member.SID -and $member.SID.Value -eq $userSid) {
-                  $canRdp = $true
-                  break
-              }
-          }
-
-          if (-not $canRdp) {
-              Add-LocalGroupMember `
-                -Group $rdpGroup.Name -Member $user.Name
-          }
-
-          # Verify membership.
-          $adminMembers = Get-LocalGroupMember -Group $adminGroup.Name
-          $verifiedAdmin = @($adminMembers | Where-Object {
-              $_.SID -and $_.SID.Value -eq $userSid
-          }).Count -gt 0
-
-          if (-not $verifiedAdmin) {
-              throw "RDP was not added to Administrators."
-          }
-
-          Write-Host "RDP user created and group membership verified."
-          Write-Host "Administrator membership: confirmed."
-          Write-Host "Remote Desktop membership: confirmed."
+          Write-Host "RDP user configured with full Administrator privileges."
 
       - name: Install Tailscale
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
           $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi'
-          $installer = Join-Path $env:TEMP 'tailscale.msi'
+          $installer = Join-Path$env:TEMP 'tailscale.msi'
 
-          Invoke-WebRequest -Uri $url -OutFile $installer
+          Invoke-WebRequest -Uri $url -OutFile$installer
 
           try {
               $process = Start-Process msiexec.exe `
-                -ArgumentList @('/i', "`"$installer`"", '/quiet', '/norestart') `
+                -ArgumentList @('/i', "`"$installer`"", 'TS_UNATTENDEDMODE=always', '/quiet', '/norestart') `
                 -Wait -PassThru
 
               if ($process.ExitCode -notin @(0, 3010)) {
@@ -185,33 +164,41 @@ jobs:
               throw "Tailscale executable not found."
           }
 
+          # Ensure Tailscale service is running before attempting connection
+          $service = Get-Service -Name 'Tailscale' -ErrorAction SilentlyContinue
+          if ($service -and$service.Status -ne 'Running') {
+              Start-Service -Name 'Tailscale'
+          }
+          Start-Sleep -Seconds 3
+
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTH_KEY)) {
               throw "TAILSCALE_AUTH_KEY secret is missing."
           }
 
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          # Use --unattended so Tailscale stays connected across different user sessions (runneradmin vs RDP)
           & $ts up `
-            "--authkey=$env:TAILSCALE_AUTH_KEY" `
-            "--hostname=gh-runner-$env:GITHUB_RUN_ID"
+            "--authkey=$env:TS_AUTH_KEY" `
+            "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
+            "--unattended" `
+            "--reset"
 
           if ($LASTEXITCODE -ne 0) {
               throw "Tailscale connection failed. Check the auth key and tailnet configuration."
           }
 
-          $tsIP = $null
+          $tsIP =$null
 
           for ($i = 0; $i -lt 12; $i++) {
-              $output = & $ts ip -4
+              $output = &$ts ip -4
 
-              if ($LASTEXITCODE -eq 0 -and $output) {
-                  $tsIP = "$($output | Select-Object -First 1)".Trim()
+              if ($LASTEXITCODE -eq 0 -and $output) {$tsIP = "$($output | Select-Object -First 1)".Trim()
                   if ($tsIP) { break }
               }
 
@@ -225,13 +212,13 @@ jobs:
           "TAILSCALE_IP=$tsIP" |
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          Write-Host "Tailscale IP assigned successfully."
+          Write-Host "Tailscale IP: $tsIP"
 
       - name: Verify Local RDP Listener
         shell: pwsh
         run: |
           $deadline = (Get-Date).AddMinutes(2)
-          $listening = $false
+          $listening =$false
 
           do {
               $listener = Get-NetTCPConnection `
@@ -239,7 +226,7 @@ jobs:
                 -ErrorAction SilentlyContinue
 
               if ($listener) {
-                  $listening = $true
+                  $listening =$true
                   break
               }
 
@@ -260,23 +247,20 @@ jobs:
           Write-Host ""
           Write-Host "========== RDP ACCESS =========="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
+          Write-Host "Username: RDP (Administrator)"
           Write-Host "Password: Use the RDP_PASSWORD GitHub secret"
           Write-Host "Automatic stop UTC: $($stopAt.ToString('u'))"
           Write-Host "================================"
 
           while ([DateTimeOffset]::UtcNow -lt $stopAt) {
-              $remaining = $stopAt - [DateTimeOffset]::UtcNow
+              $remaining =$stopAt - [DateTimeOffset]::UtcNow
 
               Write-Host "RDP active. Remaining: $($remaining.ToString('hh\:mm\:ss'))"
 
-              $sleepSeconds = [Math]::Min(
-                  60,
-                  [Math]::Max(1, [Math]::Ceiling($remaining.TotalSeconds))
+              $sleepSeconds = [Math]::Min( 60, [Math]::Max(1, [Math]::Ceiling($remaining.TotalSeconds))
               )
 
               Start-Sleep -Seconds $sleepSeconds
           }
 
           Write-Host "Selected runtime reached. Ending workflow."
-
