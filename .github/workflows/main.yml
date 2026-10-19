@@ -1,4 +1,4 @@
-
+```yaml
 name: RDP
 
 on:
@@ -53,7 +53,6 @@ jobs:
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name fDenyTSConnections -Value 0 -Force
 
-          # Keep Network Level Authentication enabled.
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name UserAuthentication -Value 1 -Force
@@ -80,11 +79,13 @@ jobs:
 
           Write-Host "RDP settings configured."
 
-      - name: Create RDP User
+      - name: Create RDP User and Assign Groups
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
+          $ErrorActionPreference = 'Stop'
+
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
               throw "RDP_PASSWORD secret is missing."
           }
@@ -104,21 +105,65 @@ jobs:
                 -AccountNeverExpires | Out-Null
           }
 
-          $group = Get-LocalGroup -SID 'S-1-5-32-555'
-          $members = Get-LocalGroupMember -Group $group.Name `
-            -ErrorAction SilentlyContinue
+          $user = Get-LocalUser -Name 'RDP'
+          $userSid = $user.SID.Value
 
-          if (-not ($members | Where-Object {
-              $_.Name -match '\\RDP$' -or $_.Name -eq 'RDP'
-          })) {
-              Add-LocalGroupMember -Group $group.Name -Member 'RDP'
+          # Add RDP to the local Administrators group.
+          $adminGroup = Get-LocalGroup -SID 'S-1-5-32-544'
+          $adminMembers = Get-LocalGroupMember `
+            -Group $adminGroup.Name -ErrorAction Stop
+
+          $isAdmin = $false
+
+          foreach ($member in $adminMembers) {
+              if ($member.SID -and $member.SID.Value -eq $userSid) {
+                  $isAdmin = $true
+                  break
+              }
           }
 
-          Write-Host "RDP user configured."
+          if (-not $isAdmin) {
+              Add-LocalGroupMember `
+                -Group $adminGroup.Name -Member $user.Name
+          }
+
+          # Add RDP to the Remote Desktop Users group.
+          $rdpGroup = Get-LocalGroup -SID 'S-1-5-32-555'
+          $rdpMembers = Get-LocalGroupMember `
+            -Group $rdpGroup.Name -ErrorAction Stop
+
+          $canRdp = $false
+
+          foreach ($member in $rdpMembers) {
+              if ($member.SID -and $member.SID.Value -eq $userSid) {
+                  $canRdp = $true
+                  break
+              }
+          }
+
+          if (-not $canRdp) {
+              Add-LocalGroupMember `
+                -Group $rdpGroup.Name -Member $user.Name
+          }
+
+          # Verify membership.
+          $adminMembers = Get-LocalGroupMember -Group $adminGroup.Name
+          $verifiedAdmin = @($adminMembers | Where-Object {
+              $_.SID -and $_.SID.Value -eq $userSid
+          }).Count -gt 0
+
+          if (-not $verifiedAdmin) {
+              throw "RDP was not added to Administrators."
+          }
+
+          Write-Host "RDP user created and group membership verified."
+          Write-Host "Administrator membership: confirmed."
+          Write-Host "Remote Desktop membership: confirmed."
 
       - name: Install Tailscale
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi'
           $installer = Join-Path $env:TEMP 'tailscale.msi'
 
@@ -143,12 +188,18 @@ jobs:
 
       - name: Establish Tailscale Connection
         shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          # Pass the GitHub secret directly, as in the original script.
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              throw "TAILSCALE_AUTH_KEY secret is missing."
+          }
+
           & $ts up `
-            "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}" `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
             "--hostname=gh-runner-$env:GITHUB_RUN_ID"
 
           if ($LASTEXITCODE -ne 0) {
@@ -175,7 +226,7 @@ jobs:
           "TAILSCALE_IP=$tsIP" |
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          Write-Host "Tailscale IP: $tsIP"
+          Write-Host "Tailscale IP assigned successfully."
 
       - name: Verify Local RDP Listener
         shell: pwsh
@@ -229,3 +280,4 @@ jobs:
           }
 
           Write-Host "Selected runtime reached. Ending workflow."
+```
