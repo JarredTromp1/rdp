@@ -78,7 +78,6 @@ jobs:
           Start-Service -Name TermService
 
           Write-Host "RDP settings configured."
-
       - name: Create RDP User
         shell: pwsh
         env:
@@ -88,33 +87,18 @@ jobs:
               throw "RDP_PASSWORD secret is missing."
           }
 
-          $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
+          $securePassword = ConvertTo-SecureString -String $env:RDP_PASSWORD -AsPlainText -Force
 
-          $user = Get-LocalUser -Name 'RDP' `
-            -ErrorAction SilentlyContinue
+          $user = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
 
           if ($user) {
               Set-LocalUser -Name 'RDP' -Password $securePassword
           } else {
-              New-LocalUser `
-                -Name 'RDP' `
-                -Password $securePassword `
-                -AccountNeverExpires | Out-Null
+              New-LocalUser -Name 'RDP' -Password $securePassword -AccountNeverExpires | Out-Null
           }
 
-          $group = Get-LocalGroup -SID 'S-1-5-32-555'
-          $members = Get-LocalGroupMember -Group$group.Name `
-            -ErrorAction SilentlyContinue
-
-          if (-not ($members | Where-Object {
-              $_.Name -match '\\RDP$' -or $_.Name -eq 'RDP'
-          })) {
-              Add-LocalGroupMember -Group $group.Name -Member 'RDP'
-          }
-
-          $adminGroup = Get-LocalGroup -SID 'S-1-5-32-544'
-          Add-LocalGroupMember -Group $adminGroup.Name -Member 'RDP' -ErrorAction SilentlyContinue
+          net localgroup "Remote Desktop Users" RDP /add
+          net localgroup "Administrators" RDP /add
 
           Write-Host "RDP user configured."
 
