@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "Session hours (1-5)"
+        description: "How many hours should the session run?"
         required: true
         default: "2"
         type: choice
@@ -22,66 +22,210 @@ jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 360
+
     env:
       RDP_HOURS: ${{ inputs.hours }}
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-      TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
     steps:
-      - name: Start Admin RDP and Tailscale
+      - name: Set Runtime Deadline
         shell: pwsh
         run: |
-          $hours = [int]$env:RDP_HOURS
-          $stopAt = [DateTimeOffset]::UtcNow.AddHours($hours)
+          $hours = 0
 
-          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
-          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 1 /f
-          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /t REG_DWORD /d 2 /f
-          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f
-          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableLUA /t REG_DWORD /d 0 /f
-          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f
+          if (-not [int]::TryParse($env:RDP_HOURS, [ref]$hours) -or
+              $hours -lt 1 -or$hours -gt 5) {
+              throw "Runtime must be between 1 and 5 hours."
+          }
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10 profile=any
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=UDP localport=3389 remoteip=100.64.0.0/10 profile=any
-          sc.exe config TermService start= demand
-          net start TermService ; $true
+          $deadline = [DateTimeOffset]::UtcNow.AddHours($hours)
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "Missing RDP_PASSWORD" }
-          net user RDP "$env:RDP_PASSWORD" /add /Y /expires:never
-          net user RDP "$env:RDP_PASSWORD" /Y
-          wmic useraccount where "Name='RDP'" set PasswordExpires=False
-          net localgroup "Administrators" RDP /add ; $true
-          net localgroup "Remote Desktop Users" RDP /add ; $true
+          "RDP_STOP_UTC=$($deadline.ToString('o'))" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $msi = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $url -OutFile $msi$proc = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" TS_UNATTENDEDMODE=always /quiet /norestart" -Wait -PassThru
-          if ($proc.ExitCode -notin @(0, 3010)) { throw "MSI failed" }
-          net start Tailscale ; $true
-          Start-Sleep -Seconds 3
+          Write-Host "Runtime: $hours hour(s)"
+          Write-Host "Deadline UTC: $($deadline.ToString('u'))"
 
-          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) { throw "Missing TAILSCALE_AUTH_KEY" }
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0 -Force
+
+          # Keep Network Level Authentication enabled.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name SecurityLayer -Value 2 -Force
+
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any
+
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service -Name TermService
+
+          Write-Host "RDP settings configured."
+
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "RDP_PASSWORD secret is missing."
+          }
+
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $user = Get-LocalUser -Name 'RDP' `
+            -ErrorAction SilentlyContinue
+
+          if ($user) {
+              Set-LocalUser -Name 'RDP' -Password $securePassword
+          } else {
+              New-LocalUser `
+                -Name 'RDP' `
+                -Password $securePassword `
+                -AccountNeverExpires | Out-Null
+          }
+
+          $group = Get-LocalGroup -SID 'S-1-5-32-555'
+          $members = Get-LocalGroupMember -Group$group.Name `
+            -ErrorAction SilentlyContinue
+
+          if (-not ($members | Where-Object {
+              $_.Name -match '\\RDP$' -or $_.Name -eq 'RDP'
+          })) {
+              Add-LocalGroupMember -Group $group.Name -Member 'RDP'
+          }
+
+          $adminGroup = Get-LocalGroup -SID 'S-1-5-32-544'
+          Add-LocalGroupMember -Group $adminGroup.Name -Member 'RDP' -ErrorAction SilentlyContinue
+
+          Write-Host "RDP user configured."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi'
+          $installer = Join-Path $env:TEMP 'tailscale.msi'
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          try {
+              $process = Start-Process msiexec.exe `
+                -ArgumentList @('/i', "`"$installer`"", '/quiet', '/norestart') `
+                -Wait -PassThru
+
+              if ($process.ExitCode -notin @(0, 3010)) {
+                  throw "Tailscale installation failed: $($process.ExitCode)"
+              }
+          }
+          finally {
+              Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          }
+
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+              throw "Tailscale executable not found."
+          }
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $ts up "--authkey=$env:TS_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID" "--unattended" "--reset"
+
+          # Pass the GitHub secret directly, as in the original script.
+          & $ts up `
+            "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}" `
+            "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
+            "--unattended"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed. Check the auth key and tailnet configuration."
+          }
 
           $tsIP =$null
-          for ($i = 0; $i -lt 15; $i++) {
-            $out = &$ts ip -4
-            if ($LASTEXITCODE -eq 0 -and $out) {$tsIP = "$($out | Select-Object -First 1)".Trim()
-              if ($tsIP) { break }
-            }
-            Start-Sleep -Seconds 3
-          }
-          if (-not $tsIP) { throw "No Tailscale IP assigned" }
 
+          for ($i = 0; $i -lt 12; $i++) {
+              $output = &$ts ip -4
+
+              if ($LASTEXITCODE -eq 0 -and $output) {$tsIP = "$($output | Select-Object -First 1)".Trim()
+                  if ($tsIP) { break }
+              }
+
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+              throw "Tailscale IP was not assigned."
+          }
+
+          "TAILSCALE_IP=$tsIP" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Verify Local RDP Listener
+        shell: pwsh
+        run: |
+          $deadline = (Get-Date).AddMinutes(2)
+          $listening =$false
+
+          do {
+              $listener = Get-NetTCPConnection `
+                -State Listen -LocalPort 3389 `
+                -ErrorAction SilentlyContinue
+
+              if ($listener) {
+                  $listening =$true
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+          } while ((Get-Date) -lt $deadline)
+
+          if (-not $listening) {
+              throw "RDP is not listening on TCP port 3389."
+          }
+
+          Write-Host "Local RDP listener is active."
+
+      - name: Maintain Connection Until Deadline
+        shell: pwsh
+        run: |
+          $stopAt = [DateTimeOffset]::Parse($env:RDP_STOP_UTC)
+
+          Write-Host ""
           Write-Host "========== RDP ACCESS =========="
-          Write-Host "IP Address = $tsIP"
-          Write-Host "Username   = RDP (Administrator)"
-          Write-Host "Password   = Your RDP_PASSWORD secret"
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: Use the RDP_PASSWORD GitHub secret"
+          Write-Host "Automatic stop UTC: $($stopAt.ToString('u'))"
           Write-Host "================================"
 
           while ([DateTimeOffset]::UtcNow -lt $stopAt) {
-            $rem =$stopAt - [DateTimeOffset]::UtcNow
-            Write-Host "RDP Active - Remaining $($rem.Hours)h $($rem.Minutes)m"
-            Start-Sleep -Seconds 60
+              $remaining =$stopAt - [DateTimeOffset]::UtcNow
+
+              Write-Host "RDP active. Remaining: $($remaining.ToString('hh\:mm\:ss'))"
+
+              $sleepSeconds = [Math]::Min( 60, [Math]::Max(1, [Math]::Ceiling($remaining.TotalSeconds))
+              )
+
+              Start-Sleep -Seconds $sleepSeconds
           }
+
+          Write-Host "Selected runtime reached. Ending workflow."
