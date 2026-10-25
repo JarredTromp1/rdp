@@ -15,14 +15,15 @@ on:
           - "4"
           - "5"
 
-permissions:
-  contents: read
+# Least privilege: the workflow does not need to read or write anything in the repo.
+permissions: {}
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 360
 
+    # Only non-secret values at job level. Secrets are scoped to the single step that needs them.
     env:
       RDP_HOURS: ${{ inputs.hours }}
 
@@ -65,6 +66,7 @@ jobs:
             -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule
 
+          # Only allow RDP from the Tailscale CGNAT range.
           New-NetFirewallRule `
             -DisplayName 'RDP-Tailscale' `
             -Direction Inbound `
@@ -72,7 +74,7 @@ jobs:
             -Protocol TCP `
             -LocalPort 3389 `
             -RemoteAddress '100.64.0.0/10' `
-            -Profile Any
+            -Profile Any | Out-Null
 
           Set-Service -Name TermService -StartupType Manual
           Start-Service -Name TermService
@@ -88,6 +90,9 @@ jobs:
               throw "RDP_PASSWORD secret is missing."
           }
 
+          # Defence in depth: explicitly mask the value in all later log output.
+          Write-Host "::add-mask::$($env:RDP_PASSWORD)"
+
           $securePassword = ConvertTo-SecureString -String $env:RDP_PASSWORD -AsPlainText -Force
 
           $user = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
@@ -98,8 +103,8 @@ jobs:
               New-LocalUser -Name 'RDP' -Password $securePassword -AccountNeverExpires | Out-Null
           }
 
-          net localgroup "Remote Desktop Users" RDP /add
-          net localgroup "Administrators" RDP /add
+          net localgroup "Remote Desktop Users" RDP /add | Out-Null
+          net localgroup "Administrators" RDP /add | Out-Null
 
           Write-Host "RDP user configured."
 
@@ -107,11 +112,17 @@ jobs:
         shell: pwsh
         run: |
           $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
-          $installer = Join-Path $env:TEMP 'tailscale.msi'
+          $installer = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
 
           Invoke-WebRequest -Uri $url -OutFile $installer
 
           try {
+              # Verify the installer is signed before running it.
+              $sig = Get-AuthenticodeSignature -FilePath $installer
+              if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notlike '*Tailscale*') {
+                  throw "Tailscale installer signature check failed: $($sig.Status)"
+              }
+
               $process = Start-Process msiexec.exe `
                 -ArgumentList @('/i', "`"$installer`"", '/quiet', '/norestart') `
                 -Wait -PassThru
@@ -133,12 +144,41 @@ jobs:
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+              throw "TAILSCALE_AUTH_KEY secret is missing or empty."
+          }
+
+          # Defence in depth: mask the key in all later log output.
+          Write-Host "::add-mask::$($env:TS_AUTHKEY)"
+
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $keyFile = Join-Path $env:RUNNER_TEMP 'ts-authkey.txt'
 
-          & $ts up "--authkey=$env:TS_AUTHKEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID" "--unattended"
+          try {
+              # Pass the key via a locked-down temp file (file: syntax) instead of the
+              # command line, so it never shows up in process arguments or command echo.
+              [System.IO.File]::WriteAllText($keyFile, $env:TS_AUTHKEY.Trim())
+              icacls $keyFile /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
 
-          if ($LASTEXITCODE -ne 0) {
-              throw "Tailscale connection failed. Check the auth key and tailnet configuration."
+              Set-Service -Name Tailscale -StartupType Automatic
+              Start-Service -Name Tailscale
+              Start-Sleep -Seconds 5
+
+              # --timeout prevents hanging on an interactive login URL if the key is bad.
+              & $ts up `
+                "--auth-key=file:$keyFile" `
+                "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
+                "--unattended" `
+                "--timeout=60s" 2>&1 | Out-Null
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Tailscale connection failed. Check that the auth key is valid, unexpired, reusable and pre-approved."
+              }
+          }
+          finally {
+              # Always remove the key from disk and from the process environment.
+              Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
+              Remove-Item Env:\TS_AUTHKEY -ErrorAction SilentlyContinue
           }
 
           $tsIP = $null
@@ -161,7 +201,7 @@ jobs:
           "TAILSCALE_IP=$tsIP" |
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          Write-Host "Tailscale IP: $tsIP"
+          Write-Host "Tailscale connected. IP: $tsIP"
 
       - name: Verify Local RDP Listener
         shell: pwsh
@@ -212,3 +252,29 @@ jobs:
           }
 
           Write-Host "Selected runtime reached. Ending workflow."
+
+      # Runs even if an earlier step failed or the job was cancelled.
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          Remove-Item (Join-Path $env:RUNNER_TEMP 'ts-authkey.txt') -Force -ErrorAction SilentlyContinue
+
+          if (Test-Path $ts) {
+              & $ts logout 2>&1 | Out-Null
+          }
+
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 1 -Force
+
+          if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name 'RDP'
+          }
+
+          Write-Host "Cleanup complete."
