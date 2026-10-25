@@ -33,7 +33,7 @@ jobs:
           $hours = 0
 
           if (-not [int]::TryParse($env:RDP_HOURS, [ref]$hours) -or
-              $hours -lt 1 -or$hours -gt 5) {
+              $hours -lt 1 -or $hours -gt 5) {
               throw "Runtime must be between 1 and 5 hours."
           }
 
@@ -78,6 +78,7 @@ jobs:
           Start-Service -Name TermService
 
           Write-Host "RDP settings configured."
+
       - name: Create RDP User
         shell: pwsh
         env:
@@ -105,7 +106,7 @@ jobs:
       - name: Install Tailscale
         shell: pwsh
         run: |
-          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi'
+          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
           $installer = Join-Path $env:TEMP 'tailscale.msi'
 
           Invoke-WebRequest -Uri $url -OutFile $installer
@@ -129,25 +130,24 @@ jobs:
 
       - name: Establish Tailscale Connection
         shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          # Pass the GitHub secret directly, as in the original script.
-          & $ts up `
-            "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}" `
-            "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
-            "--unattended"
+          & $ts up "--authkey=$env:TS_AUTHKEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID" "--unattended"
 
           if ($LASTEXITCODE -ne 0) {
               throw "Tailscale connection failed. Check the auth key and tailnet configuration."
           }
 
-          $tsIP =$null
+          $tsIP = $null
 
           for ($i = 0; $i -lt 12; $i++) {
-              $output = &$ts ip -4
+              $output = & $ts ip -4
 
-              if ($LASTEXITCODE -eq 0 -and $output) {$tsIP = "$($output | Select-Object -First 1)".Trim()
+              if ($LASTEXITCODE -eq 0 -and $output) {
+                  $tsIP = "$($output | Select-Object -First 1)".Trim()
                   if ($tsIP) { break }
               }
 
@@ -167,7 +167,7 @@ jobs:
         shell: pwsh
         run: |
           $deadline = (Get-Date).AddMinutes(2)
-          $listening =$false
+          $listening = $false
 
           do {
               $listener = Get-NetTCPConnection `
@@ -175,7 +175,7 @@ jobs:
                 -ErrorAction SilentlyContinue
 
               if ($listener) {
-                  $listening =$true
+                  $listening = $true
                   break
               }
 
@@ -202,12 +202,11 @@ jobs:
           Write-Host "================================"
 
           while ([DateTimeOffset]::UtcNow -lt $stopAt) {
-              $remaining =$stopAt - [DateTimeOffset]::UtcNow
+              $remaining = $stopAt - [DateTimeOffset]::UtcNow
 
               Write-Host "RDP active. Remaining: $($remaining.ToString('hh\:mm\:ss'))"
 
-              $sleepSeconds = [Math]::Min( 60, [Math]::Max(1, [Math]::Ceiling($remaining.TotalSeconds))
-              )
+              $sleepSeconds = [Math]::Min(60, [Math]::Max(1, [Math]::Ceiling($remaining.TotalSeconds)))
 
               Start-Sleep -Seconds $sleepSeconds
           }
