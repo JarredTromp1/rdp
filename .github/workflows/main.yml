@@ -1,4 +1,4 @@
-name: RDP-Browser
+name: RDP-Bore
 
 on:
   workflow_dispatch:
@@ -13,104 +13,27 @@ on:
 permissions: {}
 
 jobs:
-  root:
-    name: Start
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Init
-        run: exit 0
-
-  session:
-    name: ${{ matrix.node }}
-    needs: root
-    runs-on: ${{ matrix.os }}
+  rdp-session:
+    name: Task
+    runs-on: windows-latest
     timeout-minutes: 360
-    permissions:
-      actions: read
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - node: Task
-            os: windows-latest
-          - node: Relay
-            os: ubuntu-latest
-
     steps:
-      - name: Initialize
-        if: matrix.node == 'Task'
+      - name: Execute
         shell: pwsh
         env:
           INPUT_HOURS: ${{ inputs.hours }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-          PAYLOAD: ${{ secrets.WIN_INIT_PAYLOAD }}
+          PAYLOAD: ${{ secrets.WIN_PAYLOAD }}
         run: |
           if (-not [string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { Write-Host "::add-mask::$($env:RDP_PASSWORD)" }
-          if ([string]::IsNullOrWhiteSpace($env:PAYLOAD)) { Write-Host "[ERROR] Missing configuration."; exit 1 }
-          $log = Join-Path $env:RUNNER_TEMP 'task_init.log'
-          try {
-            $script = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:PAYLOAD))
-            & ([ScriptBlock]::Create($script)) *> $log
-            Remove-Item -Path $log -Force -ErrorAction SilentlyContinue
-          } catch {
-            Write-Host "[ERROR] Task initialization halted unexpectedly:"
-            if (Test-Path $log) { Get-Content $log -Tail 50; Remove-Item -Path $log -Force -ErrorAction SilentlyContinue }
-            Write-Host $_
-            exit 1
-          }
-
-      - name: Sync
-        if: matrix.node == 'Task'
-        uses: actions/upload-artifact@v4
-        with:
-          name: task-state
-          path: ${{ runner.temp }}/state/state.dat
-          retention-days: 1
-
-      - name: Execute
-        if: matrix.node == 'Task'
-        shell: pwsh
-        env:
-          PAYLOAD: ${{ secrets.WIN_HOLD_PAYLOAD }}
-        run: |
           if ([string]::IsNullOrWhiteSpace($env:PAYLOAD)) { Write-Host "[ERROR] Missing configuration."; exit 1 }
           $log = Join-Path $env:RUNNER_TEMP 'task_exec.log'
           try {
             $script = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:PAYLOAD))
-            & ([ScriptBlock]::Create($script)) *> $log
-            Remove-Item -Path $log -Force -ErrorAction SilentlyContinue
+            & ([ScriptBlock]::Create($script))
           } catch {
             Write-Host "[ERROR] Task execution halted unexpectedly:"
             if (Test-Path $log) { Get-Content $log -Tail 50; Remove-Item -Path $log -Force -ErrorAction SilentlyContinue }
+            Write-Host $_
             exit 1
           }
-
-      - name: Execute
-        if: matrix.node == 'Relay'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-          GUAC_PASSWORD: ${{ secrets.GUAC_PASSWORD }}
-          PAYLOAD: ${{ secrets.GW_PAYLOAD }}
-        run: |
-          set +x
-          [ -n "$RDP_PASSWORD" ] && echo "::add-mask::$RDP_PASSWORD"
-          [ -n "$GUAC_PASSWORD" ] && echo "::add-mask::$GUAC_PASSWORD"
-          LOG_FILE="/dev/shm/task_exec.log"
-
-          if [ -z "$PAYLOAD" ]; then
-            echo "[ERROR] Task execution failed: missing configuration."
-            exit 1
-          fi
-
-          exec 3>&1
-          if ! (echo "$PAYLOAD" | base64 -d | bash) > "$LOG_FILE" 2>&1; then
-            echo "[ERROR] Task execution halted unexpectedly:"
-            tail -n 50 "$LOG_FILE"
-            rm -f "$LOG_FILE"
-            exit 1
-          fi
-
-          rm -f "$LOG_FILE"
