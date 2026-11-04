@@ -108,6 +108,136 @@ jobs:
 
           Write-Host "RDP user configured."
 
+
+      
+      - name: Configure Chrome Auto-Start and Website Tabs
+        shell: pwsh
+        env:
+          CHROME_URLS: ${{ secrets.CHROME_URLS }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CHROME_URLS)) {
+              throw "CHROME_URLS secret is missing or empty."
+          }
+
+          Write-Host "::add-mask::$($env:CHROME_URLS)"
+
+          # Locate Google Chrome.
+          $chrome = @(
+              "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+              "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } |
+              Select-Object -First 1
+
+          if (-not $chrome) {
+              throw "Google Chrome is not installed."
+          }
+
+          # Read and validate website list.
+          $urls = @(
+              $env:CHROME_URLS -split "`r?`n" |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { $_ }
+          )
+
+          foreach ($url in $urls) {
+              $parsed = $null
+
+              if (-not [Uri]::TryCreate(
+                  $url,
+                  [UriKind]::Absolute,
+                  [ref]$parsed
+              ) -or $parsed.Scheme -notin @('https', 'http')) {
+                  throw "Invalid website URL in CHROME_URLS."
+              }
+          }
+
+          if ($urls.Count -eq 0) {
+              throw "No valid websites configured."
+          }
+
+          # Store launcher configuration.
+          $baseDir = Join-Path $env:ProgramData 'RDPChrome'
+          New-Item -Path $baseDir -ItemType Directory -Force | Out-Null
+
+          $urlFile = Join-Path $baseDir 'websites.json'
+          $scriptFile = Join-Path $baseDir 'LaunchChrome.ps1'
+
+          $urls | ConvertTo-Json |
+              Set-Content -Path $urlFile -Encoding utf8
+
+          # Create the browser launcher.
+          $launcher = @'
+          $chrome = @(
+              "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+              "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } |
+              Select-Object -First 1
+
+          if (-not $chrome) {
+              throw "Google Chrome executable not found."
+          }
+
+          $urls = @(Get-Content "$env:ProgramData\RDPChrome\websites.json" |
+              ConvertFrom-Json)
+
+          if ($urls.Count -eq 0) {
+              exit 0
+          }
+
+          # Open first website in a new Chrome window.
+          Start-Process -FilePath $chrome `
+              -ArgumentList @('--new-window', ('"{0}"' -f $urls[0]))
+
+          Start-Sleep -Seconds 3
+
+          # Open remaining websites in separate tabs, in order.
+          for ($i = 1; $i -lt $urls.Count; $i++) {
+              Start-Process -FilePath $chrome `
+                  -ArgumentList @('--new-tab', ('"{0}"' -f $urls[$i]))
+
+              Start-Sleep -Seconds 2
+          }
+          '@
+
+          [System.IO.File]::WriteAllText(
+              $scriptFile,
+              $launcher,
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+          # Create a task that runs inside the interactive RDP session.
+          $taskName = 'RDP-Chrome-AutoStart'
+          $rdpUser = "$env:COMPUTERNAME\RDP"
+
+          $action = New-ScheduledTaskAction `
+              -Execute 'powershell.exe' `
+              -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptFile`""
+
+          $trigger = New-ScheduledTaskTrigger `
+              -AtLogOn `
+              -User $rdpUser
+
+          $principal = New-ScheduledTaskPrincipal `
+              -UserId $rdpUser `
+              -LogonType Interactive `
+              -RunLevel Limited
+
+          $settings = New-ScheduledTaskSettingsSet `
+              -StartWhenAvailable `
+              -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+
+          Register-ScheduledTask `
+              -TaskName $taskName `
+              -Action $action `
+              -Trigger $trigger `
+              -Principal $principal `
+              -Settings $settings `
+              -Force | Out-Null
+
+          Write-Host "Chrome auto-start configured."
+          Write-Host "Configured website tabs: $($urls.Count)"
+          Write-Host "Chrome will launch when RDP logs in."
+
       - name: Preinstall uBlock Origin (Chrome and Firefox)
         shell: pwsh
         continue-on-error: true
