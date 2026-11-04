@@ -105,10 +105,12 @@ jobs:
 
           net localgroup "Remote Desktop Users" RDP /add | Out-Null
           net localgroup "Administrators" RDP /add | Out-Null
+          
 
           Write-Host "RDP user configured."
 
 
+      
       
       - name: Configure Chrome Auto-Start and Website Tabs
         shell: pwsh
@@ -121,7 +123,7 @@ jobs:
 
           Write-Host "::add-mask::$($env:CHROME_URLS)"
 
-          # Locate Google Chrome.
+          # Locate Chrome.
           $chrome = @(
               "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
               "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
@@ -132,41 +134,57 @@ jobs:
               throw "Google Chrome is not installed."
           }
 
-          # Read and validate website list.
+          # Parse URLs: exactly one URL per line.
           $urls = @(
-              $env:CHROME_URLS -split "`r?`n" |
+              $env:CHROME_URLS -split '\r?\n' |
               ForEach-Object { $_.Trim() } |
               Where-Object { $_ }
           )
 
+          if ($urls.Count -eq 0) {
+              throw "No websites configured."
+          }
+
+          # Validate every URL independently.
+          $validatedUrls = @()
+
           foreach ($url in $urls) {
               $parsed = $null
 
-              if (-not [Uri]::TryCreate(
-                  $url,
-                  [UriKind]::Absolute,
-                  [ref]$parsed
-              ) -or $parsed.Scheme -notin @('https', 'http')) {
-                  throw "Invalid website URL in CHROME_URLS."
+              if ($url -match '\s' -or
+                  -not [Uri]::TryCreate(
+                      $url,
+                      [UriKind]::Absolute,
+                      [ref]$parsed
+                  ) -or
+                  $parsed.Scheme -notin @('https', 'http') -or
+                  -not $parsed.Host) {
+                  throw "Invalid URL. Configure one complete HTTP/HTTPS URL per line."
               }
-          }
 
-          if ($urls.Count -eq 0) {
-              throw "No valid websites configured."
+              $validatedUrls += $parsed.AbsoluteUri
           }
 
           # Store launcher configuration.
           $baseDir = Join-Path $env:ProgramData 'RDPChrome'
-          New-Item -Path $baseDir -ItemType Directory -Force | Out-Null
+          New-Item -Path $baseDir -ItemType Directory -Force |
+              Out-Null
 
           $urlFile = Join-Path $baseDir 'websites.json'
           $scriptFile = Join-Path $baseDir 'LaunchChrome.ps1'
 
-          $urls | ConvertTo-Json |
-              Set-Content -Path $urlFile -Encoding utf8
+          $json = ConvertTo-Json -InputObject $validatedUrls -Depth 3
 
-          # Create the browser launcher.
+          [System.IO.File]::WriteAllText(
+              $urlFile,
+              $json,
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+          # Chrome launcher.
           $launcher = @'
+          $ErrorActionPreference = 'Stop'
+
           $chrome = @(
               "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
               "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
@@ -174,29 +192,42 @@ jobs:
               Select-Object -First 1
 
           if (-not $chrome) {
-              throw "Google Chrome executable not found."
+              throw "Chrome executable not found."
           }
 
-          $urls = @(Get-Content "$env:ProgramData\RDPChrome\websites.json" |
-              ConvertFrom-Json)
+          $urlFile = "$env:ProgramData\RDPChrome\websites.json"
+
+          $urls = @(
+              Get-Content -Path $urlFile -Raw |
+              ConvertFrom-Json
+          )
 
           if ($urls.Count -eq 0) {
-              exit 0
+              throw "No configured websites."
           }
 
-          # Open first website in a new Chrome window.
+          # Dedicated profile prevents stale browser session restoration.
+          $profile = Join-Path $env:LOCALAPPDATA 'RDPChromeProfile'
+
+          New-Item -Path $profile -ItemType Directory -Force |
+              Out-Null
+
+          # Launch Chrome exactly once.
+          # First URL becomes the first tab.
+          # Remaining URLs open in the same window as additional tabs.
+          $chromeArgs = @(
+              '--new-window'
+              '--no-first-run'
+              '--no-default-browser-check'
+              '--disable-session-crashed-bubble'
+              "--user-data-dir=$profile"
+          )
+
+          $chromeArgs += $urls
+
           Start-Process -FilePath $chrome `
-              -ArgumentList @('--new-window', ('"{0}"' -f $urls[0]))
+              -ArgumentList $chromeArgs
 
-          Start-Sleep -Seconds 3
-
-          # Open remaining websites in separate tabs, in order.
-          for ($i = 1; $i -lt $urls.Count; $i++) {
-              Start-Process -FilePath $chrome `
-                  -ArgumentList @('--new-tab', ('"{0}"' -f $urls[$i]))
-
-              Start-Sleep -Seconds 2
-          }
           '@
 
           [System.IO.File]::WriteAllText(
@@ -205,7 +236,7 @@ jobs:
               [System.Text.UTF8Encoding]::new($false)
           )
 
-          # Create a task that runs inside the interactive RDP session.
+          # Configure interactive RDP logon task.
           $taskName = 'RDP-Chrome-AutoStart'
           $rdpUser = "$env:COMPUTERNAME\RDP"
 
@@ -224,7 +255,8 @@ jobs:
 
           $settings = New-ScheduledTaskSettingsSet `
               -StartWhenAvailable `
-              -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+              -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+              -MultipleInstances IgnoreNew
 
           Register-ScheduledTask `
               -TaskName $taskName `
@@ -235,8 +267,14 @@ jobs:
               -Force | Out-Null
 
           Write-Host "Chrome auto-start configured."
-          Write-Host "Configured website tabs: $($urls.Count)"
-          Write-Host "Chrome will launch when RDP logs in."
+          Write-Host "Number of website tabs: $($validatedUrls.Count)"
+
+          foreach ($url in $validatedUrls) {
+              Write-Host "Configured website: $(([Uri]$url).Host)"
+          }
+
+          Write-Host "Chrome will launch automatically at RDP login."
+
 
       - name: Preinstall uBlock Origin (Chrome and Firefox)
         shell: pwsh
