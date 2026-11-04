@@ -142,6 +142,7 @@ jobs:
       # --------------------------------------------------
       # 4. CHROME AUTO START AND WEBSITE CONFIGURATION
       # --------------------------------------------------
+      
       - name: Configure Chrome Auto-Start and Website Tabs
         shell: pwsh
         env:
@@ -153,6 +154,8 @@ jobs:
               throw "CHROME_URLS secret is missing."
           }
 
+          Write-Host "::add-mask::$($env:CHROME_URLS)"
+
           # Locate Chrome.
           $chrome = @(
               "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
@@ -161,10 +164,10 @@ jobs:
               Select-Object -First 1
 
           if (-not $chrome) {
-              throw "Google Chrome is not installed."
+              throw "Chrome executable not found."
           }
 
-          # Parse one URL per line.
+          # Parse website list.
           $urls = @(
               $env:CHROME_URLS -split '\r?\n' |
               ForEach-Object { $_.Trim() } |
@@ -172,10 +175,10 @@ jobs:
           )
 
           if ($urls.Count -eq 0) {
-              throw "No website URLs configured."
+              throw "No websites configured."
           }
 
-          # Validate each URL.
+          # Validate URLs individually.
           $validated = @()
 
           foreach ($url in $urls) {
@@ -189,68 +192,52 @@ jobs:
                   ) -or
                   $parsed.Scheme -notin @('https', 'http') -or
                   -not $parsed.Host) {
-                  throw "Invalid URL. Use one complete URL per line."
+                  throw "Invalid website URL: $url"
               }
 
               $validated += $parsed.AbsoluteUri
           }
 
-          # Create configuration directory.
+          # Create persistent configuration directory.
           $baseDir = Join-Path $env:ProgramData 'RDPChrome'
 
           New-Item -Path $baseDir -ItemType Directory -Force |
               Out-Null
 
+          $urlFile = Join-Path $baseDir 'websites.json'
           $scriptFile = Join-Path $baseDir 'LaunchChrome.ps1'
 
-          # Chrome enterprise policies.
+          # IMPORTANT: Actually save the URL list.
+          $json = ConvertTo-Json -InputObject @($validated) -Depth 3
+
+          [System.IO.File]::WriteAllText(
+              $urlFile,
+              $json,
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+          Write-Host "Saved $($validated.Count) website URLs."
+
+          # Remove conflicting startup URL policies.
           $policyPath = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
 
-          New-Item -Path $policyPath -Force | Out-Null
+          if (Test-Path $policyPath) {
+              Remove-ItemProperty -Path $policyPath `
+                  -Name 'RestoreOnStartup' `
+                  -ErrorAction SilentlyContinue
 
-          # Open configured URLs on browser startup.
-          New-ItemProperty -Path $policyPath `
-              -Name 'RestoreOnStartup' `
-              -PropertyType DWord `
-              -Value 4 -Force | Out-Null
-
-          # Suppress first-run account/default-browser prompts.
-          New-ItemProperty -Path $policyPath `
-              -Name 'BrowserSignin' `
-              -PropertyType DWord `
-              -Value 0 -Force | Out-Null
-
-          New-ItemProperty -Path $policyPath `
-              -Name 'SyncDisabled' `
-              -PropertyType DWord `
-              -Value 1 -Force | Out-Null
-
-          New-ItemProperty -Path $policyPath `
-              -Name 'DefaultBrowserSettingEnabled' `
-              -PropertyType DWord `
-              -Value 0 -Force | Out-Null
-
-          # Recreate startup URL policy list.
-          $urlPolicy = Join-Path $policyPath 'RestoreOnStartupURLs'
-
-          Remove-Item -Path $urlPolicy -Recurse -Force `
-              -ErrorAction SilentlyContinue
-
-          New-Item -Path $urlPolicy -Force | Out-Null
-
-          for ($i = 0; $i -lt $validated.Count; $i++) {
-              New-ItemProperty -Path $urlPolicy `
-                  -Name "$i" `
-                  -PropertyType String `
-                  -Value $validated[$i] `
-                  -Force | Out-Null
+              Remove-Item `
+                  -Path (Join-Path $policyPath 'RestoreOnStartupURLs') `
+                  -Recurse -Force `
+                  -ErrorAction SilentlyContinue
           }
 
-          # Create Chrome launcher script.
+          # Create actual Chrome launcher.
           $launcher = @'
           $ErrorActionPreference = 'Stop'
 
           $baseDir = "$env:ProgramData\RDPChrome"
+          $urlFile = Join-Path $baseDir 'websites.json'
           $logFile = Join-Path $baseDir 'launcher.log'
 
           function Write-Log($message) {
@@ -259,48 +246,79 @@ jobs:
           }
 
           try {
+              $timer = [System.Diagnostics.Stopwatch]::StartNew()
+
               if ($env:USERNAME -ne 'RDP') {
+                  Write-Log "Skipped: unexpected user $env:USERNAME"
                   exit 0
               }
 
-              Write-Log "RDP login detected."
+              Write-Log "RDP interactive login detected."
 
-              Start-Sleep -Seconds 8
+              # Read saved URLs.
+              if (-not (Test-Path $urlFile)) {
+                  throw "Website configuration file missing."
+              }
 
+              $urls = @(
+                  ConvertFrom-Json -InputObject (
+                      Get-Content -Path $urlFile -Raw
+                  )
+              )
+
+              if ($urls.Count -eq 0) {
+                  throw "No website URLs found."
+              }
+
+              # Locate Chrome.
               $chrome = @(
                   "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
                   "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
-              ) | Where-Object { $_ -and (Test-Path $_) } |
-                  Select-Object -First 1
+              ) | Where-Object {
+                  $_ -and (Test-Path $_)
+              } | Select-Object -First 1
 
               if (-not $chrome) {
                   throw "Chrome executable not found."
               }
 
-              $profile = Join-Path $env:LOCALAPPDATA 'RDPChromeProfile'
+              # Dedicated browser profile.
+              $profile = Join-Path `
+                  $env:LOCALAPPDATA 'RDPChromeProfile'
 
-              New-Item -Path $profile -ItemType Directory -Force |
-                  Out-Null
+              New-Item -Path $profile `
+                  -ItemType Directory -Force | Out-Null
 
-              Write-Log "Starting Chrome."
-
+              # One Chrome window with every website as a separate tab.
               $arguments = @(
                   '--new-window'
                   '--no-first-run'
                   '--no-default-browser-check'
                   '--disable-session-crashed-bubble'
-                  "--user-data-dir=$profile"
+                  "--user-data-dir=`"$profile`""
               )
 
-              Start-Process -FilePath $chrome `
-                  -ArgumentList $arguments
+              foreach ($url in $urls) {
+                  $arguments += "`"$url`""
+              }
 
-              Write-Log "Chrome launch submitted."
+              Write-Log "Launching Chrome with $($urls.Count) URLs."
+
+              $process = Start-Process `
+                  -FilePath $chrome `
+                  -ArgumentList $arguments `
+                  -PassThru
+
+              Write-Log "Chrome process started. PID=$($process.Id)"
+
+              $timer.Stop()
+
+              Write-Log "Launch completed in $($timer.Elapsed.TotalSeconds) seconds."
 
           }
           catch {
               Write-Log "ERROR: $($_.Exception.Message)"
-              throw
+              exit 1
           }
           '@
 
@@ -310,7 +328,7 @@ jobs:
               [System.Text.UTF8Encoding]::new($false)
           )
 
-          # Windows machine-level logon startup.
+          # Register machine-level interactive logon startup.
           $runPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
 
           $powershell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -323,19 +341,17 @@ jobs:
               -Value $command `
               -Force | Out-Null
 
-          # Remove old scheduled-task launcher.
+          # Remove previous scheduled-task launcher.
           Unregister-ScheduledTask `
               -TaskName 'RDP-Chrome-AutoStart' `
               -Confirm:$false `
               -ErrorAction SilentlyContinue
 
-          Write-Host "Chrome startup configured."
+          Write-Host "Chrome launcher configured."
           Write-Host "Website count: $($validated.Count)"
-          Write-Host "Chrome executable: $chrome"
+          Write-Host "Chrome: $chrome"
+          Write-Host "Startup: Windows interactive logon."
 
-          foreach ($url in $validated) {
-              Write-Host "Configured: $(([Uri]$url).Host)"
-          }
 
       # --------------------------------------------------
       # 5. INSTALL UBLOCK ORIGIN LITE FOR CHROME
