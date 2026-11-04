@@ -1,3 +1,4 @@
+
 name: RDP
 
 on:
@@ -15,7 +16,7 @@ on:
           - "4"
           - "5"
 
-# Least privilege: the workflow does not need to read or write anything in the repo.
+# No repository access required.
 permissions: {}
 
 jobs:
@@ -23,11 +24,14 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
 
-    # Only non-secret values at job level. Secrets are scoped to the single step that needs them.
     env:
       RDP_HOURS: ${{ inputs.hours }}
 
     steps:
+
+      # --------------------------------------------------
+      # 1. SET RUNTIME DEADLINE
+      # --------------------------------------------------
       - name: Set Runtime Deadline
         shell: pwsh
         run: |
@@ -41,87 +45,113 @@ jobs:
           $deadline = [DateTimeOffset]::UtcNow.AddHours($hours)
 
           "RDP_STOP_UTC=$($deadline.ToString('o'))" |
-            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           Write-Host "Runtime: $hours hour(s)"
           Write-Host "Deadline UTC: $($deadline.ToString('u'))"
 
+      # --------------------------------------------------
+      # 2. CONFIGURE RDP AND FIREWALL
+      # --------------------------------------------------
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0 -Force
+          $ErrorActionPreference = 'Stop'
+
+          $rdpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $tcpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+
+          Set-ItemProperty -Path $rdpPath `
+              -Name fDenyTSConnections -Value 0 -Force
 
           # Keep Network Level Authentication enabled.
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 1 -Force
+          Set-ItemProperty -Path $tcpPath `
+              -Name UserAuthentication -Value 1 -Force
 
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name SecurityLayer -Value 2 -Force
+          # TLS security layer.
+          Set-ItemProperty -Path $tcpPath `
+              -Name SecurityLayer -Value 2 -Force
 
+          # Remove old firewall rule.
           Get-NetFirewallRule -DisplayName 'RDP-Tailscale' `
-            -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
+              -ErrorAction SilentlyContinue |
+              Remove-NetFirewallRule
 
-          # Only allow RDP from the Tailscale CGNAT range.
+          # Allow RDP only through Tailscale CGNAT addresses.
           New-NetFirewallRule `
-            -DisplayName 'RDP-Tailscale' `
-            -Direction Inbound `
-            -Action Allow `
-            -Protocol TCP `
-            -LocalPort 3389 `
-            -RemoteAddress '100.64.0.0/10' `
-            -Profile Any | Out-Null
+              -DisplayName 'RDP-Tailscale' `
+              -Direction Inbound `
+              -Action Allow `
+              -Protocol TCP `
+              -LocalPort 3389 `
+              -RemoteAddress '100.64.0.0/10' `
+              -Profile Any | Out-Null
 
           Set-Service -Name TermService -StartupType Manual
           Start-Service -Name TermService
 
-          Write-Host "RDP settings configured."
+          Write-Host "RDP configured with NLA and TLS."
 
-      - name: Create RDP User
+      # --------------------------------------------------
+      # 3. CREATE RDP ADMINISTRATOR ACCOUNT
+      # --------------------------------------------------
+      - name: Create RDP Administrator User
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
+          $ErrorActionPreference = 'Stop'
+
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
               throw "RDP_PASSWORD secret is missing."
           }
 
-          # Defence in depth: explicitly mask the value in all later log output.
           Write-Host "::add-mask::$($env:RDP_PASSWORD)"
 
-          $securePassword = ConvertTo-SecureString -String $env:RDP_PASSWORD -AsPlainText -Force
+          $securePassword = ConvertTo-SecureString `
+              -String $env:RDP_PASSWORD `
+              -AsPlainText -Force
 
-          $user = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+          $user = Get-LocalUser -Name 'RDP' `
+              -ErrorAction SilentlyContinue
 
           if ($user) {
               Set-LocalUser -Name 'RDP' -Password $securePassword
-          } else {
-              New-LocalUser -Name 'RDP' -Password $securePassword -AccountNeverExpires | Out-Null
+          }
+          else {
+              New-LocalUser `
+                  -Name 'RDP' `
+                  -Password $securePassword `
+                  -AccountNeverExpires | Out-Null
           }
 
-          net localgroup "Remote Desktop Users" RDP /add | Out-Null
-          net localgroup "Administrators" RDP /add | Out-Null
-          
+          # Full local Administrator privileges.
+          & net.exe localgroup "Remote Desktop Users" RDP /add
+          if ($LASTEXITCODE -ne 0) {
+              throw "Could not add RDP to Remote Desktop Users."
+          }
 
-          Write-Host "RDP user configured."
+          & net.exe localgroup "Administrators" RDP /add
+          if ($LASTEXITCODE -ne 0) {
+              throw "Could not add RDP to Administrators."
+          }
 
+          Write-Host "RDP account created."
+          Write-Host "Administrator membership enabled."
 
-      
-      
+      # --------------------------------------------------
+      # 4. CHROME AUTO START AND WEBSITE CONFIGURATION
+      # --------------------------------------------------
       - name: Configure Chrome Auto-Start and Website Tabs
         shell: pwsh
         env:
           CHROME_URLS: ${{ secrets.CHROME_URLS }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:CHROME_URLS)) {
-              throw "CHROME_URLS secret is missing or empty."
-          }
+          $ErrorActionPreference = 'Stop'
 
-          Write-Host "::add-mask::$($env:CHROME_URLS)"
+          if ([string]::IsNullOrWhiteSpace($env:CHROME_URLS)) {
+              throw "CHROME_URLS secret is missing."
+          }
 
           # Locate Chrome.
           $chrome = @(
@@ -134,7 +164,7 @@ jobs:
               throw "Google Chrome is not installed."
           }
 
-          # Parse URLs: exactly one URL per line.
+          # Parse one URL per line.
           $urls = @(
               $env:CHROME_URLS -split '\r?\n' |
               ForEach-Object { $_.Trim() } |
@@ -142,11 +172,11 @@ jobs:
           )
 
           if ($urls.Count -eq 0) {
-              throw "No websites configured."
+              throw "No website URLs configured."
           }
 
-          # Validate every URL independently.
-          $validatedUrls = @()
+          # Validate each URL.
+          $validated = @()
 
           foreach ($url in $urls) {
               $parsed = $null
@@ -159,75 +189,119 @@ jobs:
                   ) -or
                   $parsed.Scheme -notin @('https', 'http') -or
                   -not $parsed.Host) {
-                  throw "Invalid URL. Configure one complete HTTP/HTTPS URL per line."
+                  throw "Invalid URL. Use one complete URL per line."
               }
 
-              $validatedUrls += $parsed.AbsoluteUri
+              $validated += $parsed.AbsoluteUri
           }
 
-          # Store launcher configuration.
+          # Create configuration directory.
           $baseDir = Join-Path $env:ProgramData 'RDPChrome'
+
           New-Item -Path $baseDir -ItemType Directory -Force |
               Out-Null
 
-          $urlFile = Join-Path $baseDir 'websites.json'
           $scriptFile = Join-Path $baseDir 'LaunchChrome.ps1'
 
-          $json = ConvertTo-Json -InputObject $validatedUrls -Depth 3
+          # Chrome enterprise policies.
+          $policyPath = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
 
-          [System.IO.File]::WriteAllText(
-              $urlFile,
-              $json,
-              [System.Text.UTF8Encoding]::new($false)
-          )
+          New-Item -Path $policyPath -Force | Out-Null
 
-          # Chrome launcher.
+          # Open configured URLs on browser startup.
+          New-ItemProperty -Path $policyPath `
+              -Name 'RestoreOnStartup' `
+              -PropertyType DWord `
+              -Value 4 -Force | Out-Null
+
+          # Suppress first-run account/default-browser prompts.
+          New-ItemProperty -Path $policyPath `
+              -Name 'BrowserSignin' `
+              -PropertyType DWord `
+              -Value 0 -Force | Out-Null
+
+          New-ItemProperty -Path $policyPath `
+              -Name 'SyncDisabled' `
+              -PropertyType DWord `
+              -Value 1 -Force | Out-Null
+
+          New-ItemProperty -Path $policyPath `
+              -Name 'DefaultBrowserSettingEnabled' `
+              -PropertyType DWord `
+              -Value 0 -Force | Out-Null
+
+          # Recreate startup URL policy list.
+          $urlPolicy = Join-Path $policyPath 'RestoreOnStartupURLs'
+
+          Remove-Item -Path $urlPolicy -Recurse -Force `
+              -ErrorAction SilentlyContinue
+
+          New-Item -Path $urlPolicy -Force | Out-Null
+
+          for ($i = 0; $i -lt $validated.Count; $i++) {
+              New-ItemProperty -Path $urlPolicy `
+                  -Name "$i" `
+                  -PropertyType String `
+                  -Value $validated[$i] `
+                  -Force | Out-Null
+          }
+
+          # Create Chrome launcher script.
           $launcher = @'
           $ErrorActionPreference = 'Stop'
 
-          $chrome = @(
-              "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-              "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
-          ) | Where-Object { $_ -and (Test-Path $_) } |
-              Select-Object -First 1
+          $baseDir = "$env:ProgramData\RDPChrome"
+          $logFile = Join-Path $baseDir 'launcher.log'
 
-          if (-not $chrome) {
-              throw "Chrome executable not found."
+          function Write-Log($message) {
+              Add-Content -Path $logFile `
+                  -Value "$(Get-Date -Format o) $message"
           }
 
-          $urlFile = "$env:ProgramData\RDPChrome\websites.json"
+          try {
+              if ($env:USERNAME -ne 'RDP') {
+                  exit 0
+              }
 
-          $urls = @(
-              Get-Content -Path $urlFile -Raw |
-              ConvertFrom-Json
-          )
+              Write-Log "RDP login detected."
 
-          if ($urls.Count -eq 0) {
-              throw "No configured websites."
+              Start-Sleep -Seconds 8
+
+              $chrome = @(
+                  "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+                  "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+              ) | Where-Object { $_ -and (Test-Path $_) } |
+                  Select-Object -First 1
+
+              if (-not $chrome) {
+                  throw "Chrome executable not found."
+              }
+
+              $profile = Join-Path $env:LOCALAPPDATA 'RDPChromeProfile'
+
+              New-Item -Path $profile -ItemType Directory -Force |
+                  Out-Null
+
+              Write-Log "Starting Chrome."
+
+              $arguments = @(
+                  '--new-window'
+                  '--no-first-run'
+                  '--no-default-browser-check'
+                  '--disable-session-crashed-bubble'
+                  "--user-data-dir=$profile"
+              )
+
+              Start-Process -FilePath $chrome `
+                  -ArgumentList $arguments
+
+              Write-Log "Chrome launch submitted."
+
           }
-
-          # Dedicated profile prevents stale browser session restoration.
-          $profile = Join-Path $env:LOCALAPPDATA 'RDPChromeProfile'
-
-          New-Item -Path $profile -ItemType Directory -Force |
-              Out-Null
-
-          # Launch Chrome exactly once.
-          # First URL becomes the first tab.
-          # Remaining URLs open in the same window as additional tabs.
-          $chromeArgs = @(
-              '--new-window'
-              '--no-first-run'
-              '--no-default-browser-check'
-              '--disable-session-crashed-bubble'
-              "--user-data-dir=$profile"
-          )
-
-          $chromeArgs += $urls
-
-          Start-Process -FilePath $chrome `
-              -ArgumentList $chromeArgs
-
+          catch {
+              Write-Log "ERROR: $($_.Exception.Message)"
+              throw
+          }
           '@
 
           [System.IO.File]::WriteAllText(
@@ -236,168 +310,198 @@ jobs:
               [System.Text.UTF8Encoding]::new($false)
           )
 
-          # Configure interactive RDP logon task.
-          $taskName = 'RDP-Chrome-AutoStart'
-          $rdpUser = "$env:COMPUTERNAME\RDP"
+          # Windows machine-level logon startup.
+          $runPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
 
-          $action = New-ScheduledTaskAction `
-              -Execute 'powershell.exe' `
-              -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptFile`""
+          $powershell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 
-          $trigger = New-ScheduledTaskTrigger `
-              -AtLogOn `
-              -User $rdpUser
+          $command = "`"$powershell`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptFile`""
 
-          $principal = New-ScheduledTaskPrincipal `
-              -UserId $rdpUser `
-              -LogonType Interactive `
-              -RunLevel Limited
-
-          $settings = New-ScheduledTaskSettingsSet `
-              -StartWhenAvailable `
-              -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
-              -MultipleInstances IgnoreNew
-
-          Register-ScheduledTask `
-              -TaskName $taskName `
-              -Action $action `
-              -Trigger $trigger `
-              -Principal $principal `
-              -Settings $settings `
+          New-ItemProperty -Path $runPath `
+              -Name 'RDPChromeAutoStart' `
+              -PropertyType String `
+              -Value $command `
               -Force | Out-Null
 
-          Write-Host "Chrome auto-start configured."
-          Write-Host "Number of website tabs: $($validatedUrls.Count)"
+          # Remove old scheduled-task launcher.
+          Unregister-ScheduledTask `
+              -TaskName 'RDP-Chrome-AutoStart' `
+              -Confirm:$false `
+              -ErrorAction SilentlyContinue
 
-          foreach ($url in $validatedUrls) {
-              Write-Host "Configured website: $(([Uri]$url).Host)"
+          Write-Host "Chrome startup configured."
+          Write-Host "Website count: $($validated.Count)"
+          Write-Host "Chrome executable: $chrome"
+
+          foreach ($url in $validated) {
+              Write-Host "Configured: $(([Uri]$url).Host)"
           }
 
-          Write-Host "Chrome will launch automatically at RDP login."
-
-
-      - name: Preinstall uBlock Origin (Chrome and Firefox)
+      # --------------------------------------------------
+      # 5. INSTALL UBLOCK ORIGIN LITE FOR CHROME
+      #    AND UBLOCK ORIGIN FOR FIREFOX
+      # --------------------------------------------------
+      - name: Preinstall uBlock Origin
         shell: pwsh
         continue-on-error: true
         run: |
-          # ---------- Google Chrome (force-install via policy) ----------
-          # Classic uBlock Origin was removed from the Chrome Web Store (Manifest V2 shutdown),
-          # so we use uBlock Origin Lite, the official Manifest V3 version.
-          $chromeExtId  = 'ddkjiahejlhfcafbddmgiahcphecmpfh'
+          $ErrorActionPreference = 'Stop'
+
+          # Chrome: official uBlock Origin Lite.
+          $chromeExtId = 'ddkjiahejlhfcafbddmgiahcphecmpfh'
           $chromeUpdate = 'https://clients2.google.com/service/update2/crx'
-          $chromeKey    = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist'
+
+          $chromeKey = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist'
 
           New-Item -Path $chromeKey -Force | Out-Null
-          New-ItemProperty -Path $chromeKey -Name '1' -PropertyType String `
-            -Value "$chromeExtId;$chromeUpdate" -Force | Out-Null
-          Write-Host "Chrome: uBlock Origin Lite policy set."
 
-          # ---------- Mozilla Firefox (force-install via policies.json) ----------
+          New-ItemProperty -Path $chromeKey `
+              -Name '1' `
+              -PropertyType String `
+              -Value "$chromeExtId;$chromeUpdate" `
+              -Force | Out-Null
+
+          Write-Host "Chrome uBlock Origin Lite policy configured."
+
+          # Firefox: official uBlock Origin.
           $ffDir = @(
-            "$env:ProgramFiles\Mozilla Firefox",
-            "${env:ProgramFiles(x86)}\Mozilla Firefox"
-          ) | Where-Object { Test-Path "$_\firefox.exe" } | Select-Object -First 1
+              "$env:ProgramFiles\Mozilla Firefox",
+              "${env:ProgramFiles(x86)}\Mozilla Firefox"
+          ) | Where-Object {
+              Test-Path "$_\firefox.exe"
+          } | Select-Object -First 1
 
           if ($ffDir) {
               $distDir = Join-Path $ffDir 'distribution'
-              New-Item -Path $distDir -ItemType Directory -Force | Out-Null
+
+              New-Item -Path $distDir -ItemType Directory -Force |
+                  Out-Null
 
               $policy = @{
-                policies = @{
-                  ExtensionSettings = @{
-                    'uBlock0@raymondhill.net' = @{
-                      installation_mode = 'force_installed'
-                      install_url       = 'https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi'
-                      private_browsing  = $true
-                    }
+                  policies = @{
+                      ExtensionSettings = @{
+                          'uBlock0@raymondhill.net' = @{
+                              installation_mode = 'force_installed'
+                              install_url = 'https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi'
+                              private_browsing = $true
+                          }
+                      }
                   }
-                }
               } | ConvertTo-Json -Depth 10
 
-              # Write UTF-8 without BOM so Firefox parses it cleanly.
               [System.IO.File]::WriteAllText(
-                (Join-Path $distDir 'policies.json'),
-                $policy,
-                (New-Object System.Text.UTF8Encoding($false))
+                  (Join-Path $distDir 'policies.json'),
+                  $policy,
+                  [System.Text.UTF8Encoding]::new($false)
               )
-              Write-Host "Firefox: uBlock Origin policy set."
-          } else {
-              Write-Host "Firefox not found on this runner, skipping."
+
+              Write-Host "Firefox uBlock Origin policy configured."
+          }
+          else {
+              Write-Host "Firefox not found. Skipping."
           }
 
+      # --------------------------------------------------
+      # 6. INSTALL TAILSCALE
+      # --------------------------------------------------
       - name: Install Tailscale
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
           $installer = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
 
-          Invoke-WebRequest -Uri $url -OutFile $installer
-
           try {
-              # Verify the installer is signed before running it.
+              Invoke-WebRequest -Uri $url -OutFile $installer
+
+              # Verify digital signature.
               $sig = Get-AuthenticodeSignature -FilePath $installer
-              if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notlike '*Tailscale*') {
-                  throw "Tailscale installer signature check failed: $($sig.Status)"
+
+              if ($sig.Status -ne 'Valid' -or
+                  $sig.SignerCertificate.Subject -notlike '*Tailscale*') {
+                  throw "Tailscale installer signature verification failed."
               }
 
               $process = Start-Process msiexec.exe `
-                -ArgumentList @('/i', "`"$installer`"", '/quiet', '/norestart') `
-                -Wait -PassThru
+                  -ArgumentList @(
+                      '/i',
+                      "`"$installer`"",
+                      '/quiet',
+                      '/norestart'
+                  ) `
+                  -Wait -PassThru
 
               if ($process.ExitCode -notin @(0, 3010)) {
                   throw "Tailscale installation failed: $($process.ExitCode)"
               }
           }
           finally {
-              Remove-Item $installer -Force -ErrorAction SilentlyContinue
+              Remove-Item $installer -Force `
+                  -ErrorAction SilentlyContinue
           }
 
-          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
               throw "Tailscale executable not found."
           }
 
+          Write-Host "Tailscale installed."
+
+      # --------------------------------------------------
+      # 7. ESTABLISH TAILSCALE CONNECTION
+      # --------------------------------------------------
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          $ErrorActionPreference = 'Stop'
+
           if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-              throw "TAILSCALE_AUTH_KEY secret is missing or empty."
+              throw "TAILSCALE_AUTH_KEY secret is missing."
           }
 
-          # Defence in depth: mask the key in all later log output.
           Write-Host "::add-mask::$($env:TS_AUTHKEY)"
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           $keyFile = Join-Path $env:RUNNER_TEMP 'ts-authkey.txt'
 
           try {
-              # Pass the key via a locked-down temp file (file: syntax) instead of the
-              # command line, so it never shows up in process arguments or command echo.
-              [System.IO.File]::WriteAllText($keyFile, $env:TS_AUTHKEY.Trim())
-              icacls $keyFile /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+              [System.IO.File]::WriteAllText(
+                  $keyFile,
+                  $env:TS_AUTHKEY.Trim()
+              )
+
+              icacls $keyFile /inheritance:r `
+                  /grant:r "$($env:USERNAME):(R)" | Out-Null
 
               Set-Service -Name Tailscale -StartupType Automatic
               Start-Service -Name Tailscale
+
               Start-Sleep -Seconds 5
 
-              # --timeout prevents hanging on an interactive login URL if the key is bad.
+              # Use protected file instead of command-line secret.
               & $ts up `
-                "--auth-key=file:$keyFile" `
-                "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
-                "--unattended" `
-                "--timeout=60s" 2>&1 | Out-Null
+                  "--auth-key=file:$keyFile" `
+                  "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
+                  "--unattended" `
+                  "--timeout=60s" 2>&1 | Out-Null
 
               if ($LASTEXITCODE -ne 0) {
-                  throw "Tailscale connection failed. Check that the auth key is valid, unexpired, reusable and pre-approved."
+                  throw "Tailscale connection failed."
               }
           }
           finally {
-              # Always remove the key from disk and from the process environment.
-              Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
-              Remove-Item Env:\TS_AUTHKEY -ErrorAction SilentlyContinue
+              Remove-Item $keyFile -Force `
+                  -ErrorAction SilentlyContinue
+
+              Remove-Item Env:\TS_AUTHKEY `
+                  -ErrorAction SilentlyContinue
           }
 
+          # Wait for Tailscale IPv4 address.
           $tsIP = $null
 
           for ($i = 0; $i -lt 12; $i++) {
@@ -405,7 +509,10 @@ jobs:
 
               if ($LASTEXITCODE -eq 0 -and $output) {
                   $tsIP = "$($output | Select-Object -First 1)".Trim()
-                  if ($tsIP) { break }
+
+                  if ($tsIP) {
+                      break
+                  }
               }
 
               Start-Sleep -Seconds 5
@@ -416,10 +523,14 @@ jobs:
           }
 
           "TAILSCALE_IP=$tsIP" |
-            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          Write-Host "Tailscale connected. IP: $tsIP"
+          Write-Host "Tailscale connected."
+          Write-Host "Tailscale IP: $tsIP"
 
+      # --------------------------------------------------
+      # 8. VERIFY RDP LISTENER
+      # --------------------------------------------------
       - name: Verify Local RDP Listener
         shell: pwsh
         run: |
@@ -428,8 +539,9 @@ jobs:
 
           do {
               $listener = Get-NetTCPConnection `
-                -State Listen -LocalPort 3389 `
-                -ErrorAction SilentlyContinue
+                  -State Listen `
+                  -LocalPort 3389 `
+                  -ErrorAction SilentlyContinue
 
               if ($listener) {
                   $listening = $true
@@ -437,14 +549,18 @@ jobs:
               }
 
               Start-Sleep -Seconds 5
+
           } while ((Get-Date) -lt $deadline)
 
           if (-not $listening) {
               throw "RDP is not listening on TCP port 3389."
           }
 
-          Write-Host "Local RDP listener is active."
+          Write-Host "RDP listener is active."
 
+      # --------------------------------------------------
+      # 9. DISPLAY RDP DETAILS AND KEEP RUNNING
+      # --------------------------------------------------
       - name: Maintain Connection Until Deadline
         shell: pwsh
         run: |
@@ -454,7 +570,9 @@ jobs:
           Write-Host "========== RDP ACCESS =========="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: Use the RDP_PASSWORD GitHub secret"
+          Write-Host "Password: Use GitHub RDP_PASSWORD secret"
+          Write-Host "Administrator: Enabled"
+          Write-Host "Chrome: Automatic startup enabled"
           Write-Host "Automatic stop UTC: $($stopAt.ToString('u'))"
           Write-Host "================================"
 
@@ -463,33 +581,64 @@ jobs:
 
               Write-Host "RDP active. Remaining: $($remaining.ToString('hh\:mm\:ss'))"
 
-              $sleepSeconds = [Math]::Min(60, [Math]::Max(1, [Math]::Ceiling($remaining.TotalSeconds)))
+              $sleepSeconds = [Math]::Min(
+                  60,
+                  [Math]::Max(1, [Math]::Ceiling($remaining.TotalSeconds))
+              )
 
               Start-Sleep -Seconds $sleepSeconds
           }
 
           Write-Host "Selected runtime reached. Ending workflow."
 
-      # Runs even if an earlier step failed or the job was cancelled.
+      # --------------------------------------------------
+      # 10. AUTOMATIC CLEANUP
+      # --------------------------------------------------
       - name: Cleanup
         if: always()
         shell: pwsh
         run: |
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $ErrorActionPreference = 'Continue'
 
-          Remove-Item (Join-Path $env:RUNNER_TEMP 'ts-authkey.txt') -Force -ErrorAction SilentlyContinue
+          Write-Host "Starting cleanup."
+
+          # Remove temporary authentication material.
+          Remove-Item `
+              (Join-Path $env:RUNNER_TEMP 'ts-authkey.txt') `
+              -Force -ErrorAction SilentlyContinue
+
+          # Disconnect Tailscale.
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (Test-Path $ts) {
               & $ts logout 2>&1 | Out-Null
           }
 
-          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
+          # Remove firewall access rule.
+          Get-NetFirewallRule `
+              -DisplayName 'RDP-Tailscale' `
+              -ErrorAction SilentlyContinue |
+              Remove-NetFirewallRule
 
+          # Disable RDP.
           Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 1 -Force
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name fDenyTSConnections `
+              -Value 1 -Force
 
+          # Remove Chrome startup registry entry.
+          Remove-ItemProperty `
+              -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' `
+              -Name 'RDPChromeAutoStart' `
+              -ErrorAction SilentlyContinue
+
+          # Remove RDP Chrome configuration.
+          Remove-Item `
+              "$env:ProgramData\RDPChrome" `
+              -Recurse -Force `
+              -ErrorAction SilentlyContinue
+
+          # Remove temporary RDP account.
           if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) {
               Remove-LocalUser -Name 'RDP'
           }
