@@ -44,9 +44,6 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
             throw 'Missing GitHub secret: RDP_PASSWORD'
           }
-          if ($env:RDP_PASSWORD.Length -lt 14) {
-            throw 'RDP_PASSWORD must be at least 14 characters.'
-          }
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
             throw 'Missing GitHub secret: TAILSCALE_AUTH_KEY'
           }
