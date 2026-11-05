@@ -1,125 +1,73 @@
-name: Windows RDP - Tailscale + Single-Tab Website Dashboard
+name: Temporary Windows RDP via Tailscale
 
 on:
   workflow_dispatch:
     inputs:
-      session_hours:
-        description: "How long should the RDP session remain available?"
+      duration:
+        description: "How long should the RDP session stay online?"
         required: true
         type: choice
+        default: "2"
         options:
           - "1"
           - "2"
           - "3"
           - "4"
           - "5"
-        default: "3"
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-rdp-${{ github.ref }}
+  group: temporary-windows-rdp-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   rdp:
-    name: Start Windows Server 2025 RDP
+    # windows-2025 is a GitHub-hosted Windows Server 2025 runner.
     runs-on: windows-2025
-    timeout-minutes: 360
-
-    env:
-      RDP_USERNAME: RDP
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      CHROME_URLS: ${{ secrets.CHROME_URLS }}
-      SESSION_HOURS: ${{ inputs.session_hours }}
+    timeout-minutes: 370
 
     steps:
-      - name: Validate required secrets and duration
+      - name: Validate required secrets
         shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          CHROME_URLS: ${{ secrets.CHROME_URLS }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw 'Missing GitHub secret: RDP_PASSWORD'
-          }
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw 'Missing GitHub secret: TAILSCALE_AUTH_KEY'
+            throw 'Missing GitHub Actions secret: TAILSCALE_AUTH_KEY'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw 'Missing GitHub Actions secret: RDP_PASSWORD'
           }
           if ([string]::IsNullOrWhiteSpace($env:CHROME_URLS)) {
-            throw 'Missing GitHub secret: CHROME_URLS'
-          }
-          if ($env:SESSION_HOURS -notin @('1','2','3','4','5')) {
-            throw 'Invalid session duration.'
+            throw 'Missing GitHub Actions secret: CHROME_URLS'
           }
 
-          Write-Host "Requested session duration: $env:SESSION_HOURS hour(s)."
-          Write-Host 'Required secrets are present.'
-
-      - name: Configure RDP administrator account and secure firewall
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-
-          $user = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
-          if ($null -eq $user) {
-            New-LocalUser -Name $env:RDP_USERNAME `
-              -Password $securePassword `
-              -Description 'Temporary RDP administrator account' `
-              -PasswordNeverExpires `
-              -AccountNeverExpires | Out-Null
-          } else {
-            Set-LocalUser -Name $env:RDP_USERNAME `
-              -Password $securePassword `
-              -PasswordNeverExpires $true
-            Enable-LocalUser -Name $env:RDP_USERNAME
+          # Require a JSON array containing individual URL strings.
+          $parsed = ConvertFrom-Json -InputObject $env:CHROME_URLS -NoEnumerate
+          if ($null -eq $parsed -or $parsed -isnot [System.Array] -or $parsed.Count -eq 0) {
+            throw 'CHROME_URLS must be a non-empty JSON array of URL strings.'
           }
 
-          Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
-
-          # Enable RDP but keep Network Level Authentication enabled.
-          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0
-          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 1
-
-          # Disable broad built-in RDP firewall rules. A Tailscale-interface-only
-          # rule is created after Tailscale has connected.
-          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
-            Disable-NetFirewallRule
-
-          Write-Host 'RDP administrator account configured; NLA remains enabled.'
-
-      - name: Install Google Chrome
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $installer = Join-Path $env:TEMP 'chrome-enterprise-x64.msi'
-          $uri = 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'
-
-          Invoke-WebRequest -Uri $uri -OutFile $installer
-          $proc = Start-Process msiexec.exe `
-            -ArgumentList @('/i', "`"$installer`"", '/qn', '/norestart') `
-            -Wait -PassThru
-
-          if ($proc.ExitCode -notin @(0,3010)) {
-            throw "Chrome installation failed with exit code $($proc.ExitCode)."
+          foreach ($url in $parsed) {
+            if ($url -isnot [string] -or
+                $url -notmatch '^https?://' -or
+                $url -match '\s') {
+              throw "Each CHROME_URLS item must be an HTTP/HTTPS URL without whitespace."
+            }
           }
 
-          $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-          if (-not (Test-Path $chrome)) {
-            throw 'Chrome installation completed but chrome.exe was not found.'
-          }
-
-          Write-Host "Chrome installed: $chrome"
+          Write-Host "Validated $($parsed.Count) Chrome tab URL(s)."
 
       - name: Install and connect Tailscale
         shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -128,56 +76,100 @@ jobs:
             -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
             -OutFile $msi
 
-          $install = Start-Process msiexec.exe `
-            -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart') `
-            -Wait -PassThru
-
-          if ($install.ExitCode -notin @(0,3010)) {
-            throw "Tailscale installation failed: $($install.ExitCode)"
+          $install = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart') -Wait -PassThru
+          if ($install.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed with exit code $($install.ExitCode)."
           }
 
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
           if (-not (Test-Path $tailscale)) {
-            throw 'Tailscale executable not found after installation.'
+            throw 'Tailscale executable was not found after installation.'
           }
 
-          & $tailscale up "--authkey=$env:TAILSCALE_AUTH_KEY" `
-            "--hostname=gh-rdp-$env:GITHUB_RUN_ID" `
-            --accept-dns=false
+          $keyFile = Join-Path $env:ProgramData 'tailscale-authkey.txt'
+          Set-Content -Path $keyFile -Value $env:TAILSCALE_AUTH_KEY -NoNewline
+          $acl = Get-Acl $keyFile
+          $acl.SetAccessRuleProtection($true, $false)
+          $system = New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM', 'FullControl', 'Allow')
+          $admins = New-Object System.Security.AccessControl.FileSystemAccessRule('Administrators', 'FullControl', 'Allow')
+          $acl.SetAccessRule($system)
+          $acl.SetAccessRule($admins)
+          Set-Acl -Path $keyFile -AclObject $acl
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "tailscale up failed with exit code $LASTEXITCODE"
-          }
-
-          $ip = $null
-          for ($i = 0; $i -lt 60; $i++) {
-            $ip = (& $tailscale ip -4 2>$null | Select-Object -First 1)
-            if ($ip -match '^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.') {
-              break
+          try {
+            Start-Service Tailscale
+            & $tailscale up "--auth-key=file:$keyFile" --hostname="gh-rdp-$env:GITHUB_RUN_ID" --accept-routes=false
+            if ($LASTEXITCODE -ne 0) {
+              throw "tailscale up failed with exit code $LASTEXITCODE."
             }
-            Start-Sleep -Seconds 2
+          }
+          finally {
+            Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
           }
 
-          if (-not $ip) {
-            throw 'Tailscale did not provide an IPv4 address.'
+          $status = & $tailscale status
+          $status | ForEach-Object { Write-Host $_ }
+
+          $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            throw 'Could not obtain the Tailscale IPv4 address.'
           }
 
-          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TAILSCALE_IPV4=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tailscale IPv4: $ip"
 
-          # Restrict inbound RDP to the Tailscale adapter and Tailscale CGNAT range.
-          $adapter = Get-NetAdapter |
+      - name: Configure RDP and create the RDP administrator
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Enable Remote Desktop and require Network Level Authentication.
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          # Create or update the local RDP account. No script-level minimum
+          # password length is imposed; Windows account policy still applies.
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $account = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+          if ($null -eq $account) {
+            New-LocalUser -Name 'RDP' -Password $securePassword `
+              -FullName 'Temporary RDP Administrator' `
+              -Description 'Temporary administrator for this GitHub Actions runner' `
+              -PasswordNeverExpires | Out-Null
+          }
+          else {
+            Set-LocalUser -Name 'RDP' -Password $securePassword -PasswordNeverExpires $true
+            Enable-LocalUser -Name 'RDP'
+          }
+
+          $isAdmin = Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop |
+            Where-Object { $_.Name -match '\\RDP$' -or $_.Name -eq 'RDP' }
+          if (-not $isAdmin) {
+            Add-LocalGroupMember -Group 'Administrators' -Member 'RDP'
+          }
+
+          # Disable broad built-in RDP firewall rules and allow only Tailscale.
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          $tailscaleAdapter = Get-NetAdapter |
             Where-Object {
               $_.Status -eq 'Up' -and
               ($_.Name -match 'Tailscale' -or $_.InterfaceDescription -match 'Tailscale')
             } |
             Select-Object -First 1
 
-          if (-not $adapter) {
-            Get-NetAdapter | Format-Table -AutoSize | Out-String | Write-Host
-            throw 'Tailscale network adapter not found.'
+          if ($null -eq $tailscaleAdapter) {
+            throw 'Could not find an active Tailscale network adapter.'
           }
 
+          Remove-NetFirewallRule -DisplayName 'RDP over Tailscale only' -ErrorAction SilentlyContinue
           New-NetFirewallRule `
             -DisplayName 'RDP over Tailscale only' `
             -Direction Inbound `
@@ -185,279 +177,187 @@ jobs:
             -Protocol TCP `
             -LocalPort 3389 `
             -RemoteAddress '100.64.0.0/10' `
-            -InterfaceAlias $adapter.Name `
+            -InterfaceAlias $tailscaleAdapter.Name `
             -Profile Any | Out-Null
 
-          Write-Host "RDP firewall restricted to Tailscale adapter: $($adapter.Name)"
+          # Ensure the service is listening before the session wait begins.
+          $listener = Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue
+          if (-not $listener) {
+            Start-Sleep -Seconds 5
+            $listener = Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue
+          }
+          if (-not $listener) {
+            throw 'RDP is not listening on TCP port 3389.'
+          }
 
-      - name: Configure single-tab website dashboard and RDP logon startup
+          Write-Host "RDP account is ready. Connect to $env:TAILSCALE_IPV4:3389 using username RDP."
+
+      - name: Install Google Chrome and configure individual startup tabs
         shell: pwsh
+        env:
+          CHROME_URLS: ${{ secrets.CHROME_URLS }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $base = 'C:\ProgramData\RDPChrome'
-          New-Item -Path $base -ItemType Directory -Force | Out-Null
+          $chromeMsi = Join-Path $env:TEMP 'google-chrome-enterprise.msi'
+          Invoke-WebRequest `
+            -Uri 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi' `
+            -OutFile $chromeMsi
 
-          # CHROME_URLS must be a JSON array of URL strings.
-          try {
-            $parsed = ConvertFrom-Json -InputObject $env:CHROME_URLS -AsHashtable -ErrorAction Stop
-          } catch {
-            throw "CHROME_URLS is not valid JSON: $($_.Exception.Message)"
+          $install = Start-Process msiexec.exe -ArgumentList @('/i', "`"$chromeMsi`"", '/qn', '/norestart') -Wait -PassThru
+          if ($install.ExitCode -notin @(0, 3010)) {
+            throw "Chrome installation failed with exit code $($install.ExitCode)."
           }
 
-          $script:urls = [System.Collections.Generic.List[string]]::new()
+          $chromeCandidates = @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          )
+          $chrome = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $chrome) {
+            throw 'Chrome executable was not found after installation.'
+          }
 
-          function Add-Urls($node) {
-            if ($node -is [string]) {
-              $value = $node.Trim()
-              $uri = $null
-              if (-not [Uri]::TryCreate($value, [UriKind]::Absolute, [ref]$uri) -or
-                  $uri.Scheme -notin @('http','https') -or
-                  [string]::IsNullOrWhiteSpace($uri.Host)) {
-                throw "Invalid website URL: $value"
-              }
-              $script:urls.Add($uri.AbsoluteUri)
-              return
+          $parsed = ConvertFrom-Json -InputObject $env:CHROME_URLS -NoEnumerate
+          if ($parsed -isnot [System.Array] -or $parsed.Count -eq 0) {
+            throw 'CHROME_URLS must be a non-empty JSON array.'
+          }
+
+          $urls = [System.Collections.Generic.List[string]]::new()
+          foreach ($url in $parsed) {
+            if ($url -isnot [string] -or $url -notmatch '^https?://' -or $url -match '\s') {
+              throw 'CHROME_URLS must contain only HTTP/HTTPS URL strings without whitespace.'
             }
-
-            if ($node -is [System.Array] -or
-                $node -is [System.Collections.IList]) {
-              foreach ($child in $node) { Add-Urls $child }
-              return
-            }
-
-            throw "CHROME_URLS contains unsupported JSON type: $($node.GetType().FullName)"
+            $urls.Add($url)
           }
 
-          Add-Urls $parsed
+          $configDir = Join-Path $env:ProgramData 'RDPChrome'
+          New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+          $urls.ToArray() | ConvertTo-Json -Compress |
+            Set-Content -Path (Join-Path $configDir 'websites.json') -Encoding utf8
 
-          if ($script:urls.Count -eq 0) {
-            throw 'CHROME_URLS contains no website URLs.'
-          }
-
-          # Store canonical, flat JSON for audit/debugging.
-          $canonicalJson = ConvertTo-Json -InputObject $script:urls.ToArray() -Depth 5
-          [System.IO.File]::WriteAllText(
-            (Join-Path $base 'websites.json'),
-            $canonicalJson,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-
-          # Base64 avoids unsafe interpolation of URLs into the HTML source.
-          $urlsBase64 = [Convert]::ToBase64String(
-            [System.Text.Encoding]::UTF8.GetBytes(
-              (ConvertTo-Json -InputObject $script:urls.ToArray() -Compress)
-            )
-          )
-
-          $html = @'
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width,initial-scale=1">
-            <title>RDP Website Workspace</title>
-            <style>
-              *{box-sizing:border-box}
-              html,body{height:100%;margin:0;background:#10131a;color:#e8edf7;font:14px Segoe UI,Arial,sans-serif}
-              header{height:46px;display:flex;align-items:center;justify-content:space-between;padding:0 14px;background:#171d29;border-bottom:1px solid #30394a}
-              header strong{font-size:14px}
-              #status{color:#aab7cc;font-size:12px}
-              #workspace{height:calc(100% - 46px);display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:7px;padding:7px}
-              .panel{min-width:0;min-height:0;display:flex;flex-direction:column;background:#fff;border:1px solid #30394a;border-radius:7px;overflow:hidden}
-              .panel-title{height:31px;flex:0 0 31px;padding:7px 10px;background:#202a3a;color:#e8edf7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-              iframe{border:0;width:100%;height:100%;background:white}
-              .panel:last-child:nth-child(odd){grid-column:1/-1}
-              @media(max-width:900px){#workspace{grid-template-columns:1fr;grid-template-rows:none;overflow:auto}.panel{height:70vh}.panel:last-child:nth-child(odd){grid-column:auto}}
-            </style>
-          </head>
-          <body>
-            <header><strong>RDP Website Workspace</strong><span id="status">Loading websites…</span></header>
-            <main id="workspace"></main>
-            <script>
-              const encoded = '__URLS_BASE64__';
-              const urls = JSON.parse(atob(encoded));
-              const workspace = document.getElementById('workspace');
-              const status = document.getElementById('status');
-              urls.forEach((url, index) => {
-                const panel = document.createElement('section');
-                panel.className = 'panel';
-                const title = document.createElement('div');
-                title.className = 'panel-title';
-                title.textContent = new URL(url).hostname;
-                const frame = document.createElement('iframe');
-                frame.src = url;
-                frame.title = new URL(url).hostname;
-                frame.loading = index < 2 ? 'eager' : 'lazy';
-                frame.referrerPolicy = 'strict-origin-when-cross-origin';
-                panel.append(title, frame);
-                workspace.append(panel);
-              });
-              status.textContent = `${urls.length} website panel(s)`;
-            </script>
-          </body>
-          </html>
-          '@
-
-          $html = $html.Replace('__URLS_BASE64__', $urlsBase64)
-          [System.IO.File]::WriteAllText(
-            (Join-Path $base 'dashboard.html'),
-            $html,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-
-          # Launcher runs in the interactive RDP user's desktop session.
+          # This launcher runs in the RDP user's interactive desktop session.
           $launcher = @'
           $ErrorActionPreference = 'Stop'
-          $logDir = Join-Path $env:LOCALAPPDATA 'RDPChrome'
-          New-Item -Path $logDir -ItemType Directory -Force | Out-Null
-          $log = Join-Path $logDir 'launcher.log'
+          $config = 'C:\ProgramData\RDPChrome\websites.json'
+          $urls = @(Get-Content -Raw -Path $config | ConvertFrom-Json)
+          if ($urls.Count -eq 0) { exit 0 }
 
-          function Log($message) {
-            Add-Content -LiteralPath $log -Value "$(Get-Date -Format o) $message"
+          $chromeCandidates = @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          )
+          $chrome = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $chrome) { throw 'Chrome executable not found.' }
+
+          $profile = Join-Path $env:LOCALAPPDATA 'RDPChromeProfile'
+          $arguments = @(
+            '--new-window'
+            '--no-first-run'
+            '--no-default-browser-check'
+            ('--user-data-dir="{0}"' -f $profile)
+          )
+          foreach ($url in $urls) {
+            if ($url -is [string] -and $url -match '^https?://') {
+              $arguments += $url
+            }
           }
 
-          try {
-            Log "Interactive logon startup. User=$env:USERNAME"
-
-            $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-            if (-not (Test-Path $chrome)) {
-              $chrome = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
-            }
-            if (-not (Test-Path $chrome)) {
-              throw 'Chrome executable not found.'
-            }
-
-            $dashboard = 'C:\ProgramData\RDPChrome\dashboard.html'
-            if (-not (Test-Path $dashboard)) {
-              throw 'Dashboard file not found.'
-            }
-
-            $profile = Join-Path $env:LOCALAPPDATA 'RDPChromeProfile'
-            New-Item -Path $profile -ItemType Directory -Force | Out-Null
-
-            $dashboardUrl = ([Uri]$dashboard).AbsoluteUri
-            $chromeArgs = @(
-              '--new-window',
-              '--no-first-run',
-              '--no-default-browser-check',
-              "--user-data-dir=`"$profile`"",
-              "`"$dashboardUrl`""
-            )
-
-            Start-Sleep -Seconds 5
-            Start-Process -FilePath $chrome -ArgumentList ($chromeArgs -join ' ')
-            Log "Chrome dashboard launch submitted: $dashboardUrl"
-          }
-          catch {
-            Log "ERROR: $($_.Exception.Message)"
-            exit 1
-          }
+          # Chrome opens one browser window with each configured URL in its own tab.
+          Start-Process -FilePath $chrome -ArgumentList $arguments
           '@
 
-          $launcherPath = Join-Path $base 'LaunchChrome.ps1'
-          [System.IO.File]::WriteAllText(
-            $launcherPath,
-            $launcher,
-            [System.Text.UTF8Encoding]::new($false)
+          $launcherPath = Join-Path $configDir 'Launch-ChromeTabs.ps1'
+          Set-Content -Path $launcherPath -Value $launcher -Encoding utf8
+
+          # Give the RDP user read/execute access to the URL configuration.
+          $configAcl = Get-Acl $configDir
+          $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            "$env:COMPUTERNAME\RDP",
+            'ReadAndExecute',
+            'ContainerInherit,ObjectInherit',
+            'None',
+            'Allow'
           )
+          $configAcl.SetAccessRule($userRule)
+          Set-Acl -Path $configDir -AclObject $configAcl
 
-          # Register a per-user interactive logon task. It runs only after RDP
-          # user logon, so Chrome is visible in that user's desktop session.
-          $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+          $taskName = 'Open configured Chrome tabs for RDP'
+          Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
           $action = New-ScheduledTaskAction `
-            -Execute $pwsh `
-            -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$launcherPath`""
-
-          $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\$env:RDP_USERNAME"
+            -Execute "$PSHOME\pwsh.exe" `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$launcherPath`""
+          $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\RDP"
           $principal = New-ScheduledTaskPrincipal `
-            -UserId "$env:COMPUTERNAME\$env:RDP_USERNAME" `
+            -UserId "$env:COMPUTERNAME\RDP" `
             -LogonType Interactive `
             -RunLevel Highest
+          $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable
 
-          Register-ScheduledTask `
-            -TaskName 'RDPChromeDashboard' `
-            -Action $action `
-            -Trigger $trigger `
-            -Principal $principal `
-            -Description 'Open the configured website dashboard after RDP logon.' `
-            -Force | Out-Null
+          Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force | Out-Null
 
-          Write-Host "Configured $($script:urls.Count) website panel(s) in one Chrome tab."
-          Write-Host 'RDPChromeDashboard logon task registered.'
+          Write-Host "Configured $($urls.Count) individual Chrome tab(s) to open when RDP logs in."
 
-      - name: Verify RDP listener and print connection details
+      - name: Show connection details
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          $listener = $false
-          for ($i = 0; $i -lt 30; $i++) {
-            $listener = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -InformationLevel Quiet
-            if ($listener) { break }
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $listener) {
-            throw 'RDP TCP listener did not become available on port 3389.'
-          }
-
           Write-Host ''
-          Write-Host '========== RDP READY ==========' -ForegroundColor Green
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host 'RDP port: 3389'
-          Write-Host 'Username: RDP'
-          Write-Host 'Password: use the RDP_PASSWORD GitHub secret'
-          Write-Host 'Chrome: one dashboard tab containing all configured website panels'
-          Write-Host '===============================' -ForegroundColor Green
+          Write-Host '=============================================='
+          Write-Host '       TEMPORARY WINDOWS RDP IS READY'
+          Write-Host '=============================================='
+          Write-Host "Tailscale IP : $env:TAILSCALE_IPV4"
+          Write-Host 'RDP address  : use the Tailscale IP on port 3389'
+          Write-Host 'Username     : RDP'
+          Write-Host 'Password     : the value stored in RDP_PASSWORD'
+          Write-Host 'Chrome       : configured URLs open as separate tabs after RDP login'
+          Write-Host '=============================================='
+          Write-Host ''
 
-      - name: Keep RDP session available for selected duration
+      - name: Keep RDP session available
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $durationHours = [int]'${{ inputs.duration }}'
+          $endTime = (Get-Date).AddHours($durationHours)
 
-          $hours = [int]$env:SESSION_HOURS
-          $deadline = (Get-Date).AddHours($hours)
-
-          Write-Host "RDP session will remain available until $deadline."
-
-          while ((Get-Date) -lt $deadline) {
-            $remaining = [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)
-            Write-Host "Session active. Approximately $([Math]::Ceiling($remaining / 60)) minute(s) remaining."
-            Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, $remaining)))
+          Write-Host "RDP will remain configured for $durationHours hour(s), until approximately $endTime."
+          while ((Get-Date) -lt $endTime) {
+            $remaining = [math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
+            Write-Host "RDP session active. Approximately $remaining minute(s) remaining."
+            Start-Sleep -Seconds 60
           }
 
-          Write-Host 'Requested RDP session duration completed.'
-
-      - name: Cleanup temporary RDP resources
+      - name: Cleanup
         if: always()
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
 
-          Write-Host 'Starting cleanup.'
+          Unregister-ScheduledTask -TaskName 'Open configured Chrome tabs for RDP' `
+            -Confirm:$false -ErrorAction SilentlyContinue
 
-          # Disconnect Tailscale.
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (Test-Path $tailscale) {
-            & $tailscale down
-          }
-
-          # Remove only the workflow-created firewall rule.
           Remove-NetFirewallRule -DisplayName 'RDP over Tailscale only' -ErrorAction SilentlyContinue
 
-          # Disable RDP on this ephemeral runner.
-          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
             -Name fDenyTSConnections -Value 1 -ErrorAction SilentlyContinue
 
-          # Remove the scheduled task and temporary account.
-          Unregister-ScheduledTask -TaskName 'RDPChromeDashboard' -Confirm:$false -ErrorAction SilentlyContinue
+          if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+          }
 
-          Remove-LocalGroupMember -Group 'Administrators' -Member 'RDP' -ErrorAction SilentlyContinue
-          Remove-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP' -ErrorAction SilentlyContinue
-          Remove-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+          Remove-Item -Path (Join-Path $env:ProgramData 'RDPChrome') `
+            -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path (Join-Path $env:ProgramData 'tailscale-authkey.txt') `
+            -Force -ErrorAction SilentlyContinue
 
-          # Remove workflow-created website and launcher files.
-          Remove-Item 'C:\ProgramData\RDPChrome' -Recurse -Force -ErrorAction SilentlyContinue
+          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (Test-Path $tailscale) {
+            & $tailscale down 2>$null
+          }
 
-          Write-Host 'Cleanup completed. The GitHub-hosted runner will be discarded.'
+          Write-Host 'Cleanup step completed. The GitHub-hosted runner will be discarded after the job.'
