@@ -118,6 +118,21 @@ jobs:
 
           Write-Host "Chrome installed: $chrome"
 
+          # Force-install the official uBlock Origin Lite extension for Chrome.
+          # Current Chrome uses Manifest V3; the original full uBlock Origin
+          # Manifest V2 extension is not supported in current Chrome releases.
+          $extensionId = 'ddkjiahejlhfcafbddmgiahcphecmpfh'
+          $updateUrl = 'https://clients2.google.com/service/update2/crx'
+          $policyPath = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist'
+
+          New-Item -Path $policyPath -Force | Out-Null
+          New-ItemProperty -Path $policyPath -Name '1' `
+            -PropertyType String `
+            -Value "$extensionId;$updateUrl" `
+            -Force | Out-Null
+
+          Write-Host 'Configured forced installation of uBlock Origin Lite.'
+
       - name: Install and connect Tailscale
         shell: pwsh
         run: |
@@ -383,6 +398,7 @@ jobs:
           Write-Host 'Username: RDP'
           Write-Host 'Password: use the RDP_PASSWORD GitHub secret'
           Write-Host 'Chrome: each configured website opens in its own tab'
+          Write-Host 'Ad blocker: uBlock Origin Lite is force-installed by Chrome policy'
           Write-Host '===============================' -ForegroundColor Green
 
       - name: Keep RDP session available for selected duration
