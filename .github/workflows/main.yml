@@ -426,6 +426,39 @@ jobs:
             } catch {}
           }
 
+      - name: Publish live TAILSCALE_IP for local controller
+        if: always()
+        shell: pwsh
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+          GH_TOK: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tsIp = "$env:TAILSCALE_IP".Trim()
+          if (-not $tsIp -and (Test-Path "C:\Program Files\Tailscale\tailscale.exe")) {
+            $tsIp = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1).Trim()
+          }
+          if (-not $tsIp -and (Get-Command tailscale -ErrorAction SilentlyContinue)) {
+            $tsIp = (tailscale ip -4 2>$null | Select-Object -First 1).Trim()
+          }
+          if ($tsIp) {
+            Write-Host "TAILSCALE_IP: $tsIp"
+            Write-Host "::notice title=TAILSCALE_IP::TAILSCALE_IP: $tsIp"
+            "TAILSCALE_IP: $tsIp" | Out-File -FilePath "$env:RUNNER_TEMP\tailscale_ip.txt" -Encoding utf8
+            try {
+              $body = @{ state = "success"; context = "TAILSCALE_IP"; description = "TAILSCALE_IP: $tsIp" } | ConvertTo-Json
+              Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:GH_REPO/statuses/$env:GH_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOK"; Accept = "application/vnd.github+json" } -Body $body -ContentType "application/json" | Out-Null
+            } catch {}
+          }
+
+      - name: Export live TAILSCALE_IP artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TAILSCALE_IP_${{ env.TAILSCALE_IP }}
+          path: ${{ runner.temp }}/tailscale_ip.txt
+          if-no-files-found: ignore
+
       - name: Keep RDP session available for selected duration
         shell: pwsh
         run: |
