@@ -394,12 +394,37 @@ jobs:
           Write-Host ''
           Write-Host '========== RDP READY ==========' -ForegroundColor Green
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "::notice title=TAILSCALE_IP::$(if ($TAILSCALE_IP) {"TAILSCALE_IP=$TAILSCALE_IP"} else {"$env:TAILSCALE_IP"})"
           Write-Host 'RDP port: 3389'
           Write-Host 'Username: RDP'
           Write-Host 'Password: use the RDP_PASSWORD GitHub secret'
           Write-Host 'Chrome: each configured website opens in its own tab'
           Write-Host 'Ad blocker: uBlock Origin Lite is force-installed by Chrome policy'
           Write-Host '===============================' -ForegroundColor Green
+
+      - name: Publish live TAILSCALE_IP for local controller
+        if: always()
+        shell: pwsh
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+          GH_TOK: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tsIp = ""
+          if (Test-Path "C:\Program Files\Tailscale\tailscale.exe") {
+            $tsIp = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1).Trim()
+          }
+          if (-not $tsIp -and (Get-Command tailscale -ErrorAction SilentlyContinue)) {
+            $tsIp = (tailscale ip -4 2>$null | Select-Object -First 1).Trim()
+          }
+          if ($tsIp) {
+            Write-Host "TAILSCALE_IP=$tsIp"
+            Write-Host "::notice title=TAILSCALE_IP::TAILSCALE_IP=$tsIp"
+            try {
+              $body = @{ state = "success"; context = "TAILSCALE_IP"; description = "TAILSCALE_IP=$tsIp" } | ConvertTo-Json
+              Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:GH_REPO/statuses/$env:GH_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOK"; Accept = "application/vnd.github+json" } -Body $body -ContentType "application/json" | Out-Null
+            } catch {}
+          }
 
       - name: Keep RDP session available for selected duration
         shell: pwsh
